@@ -32,6 +32,7 @@ import {
   type ExtractOptions,
 } from "./symbols.js";
 import { getLanguageForExtension, getSupportedExtensions, getRgTypeMap } from "./languages.js";
+import { parse as parseShell } from "shell-quote";
 
 const CodeNavParams = Type.Object({
   path: Type.String({ description: "File or directory path to analyze" }),
@@ -270,67 +271,59 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
     const cmd = event.input.command;
     if (!cmd) return;
 
-    // Check if the command uses grep or rg
-    const grepMatch = cmd.match(/\b(grep|rg|ripgrep)\b/);
-    if (!grepMatch) return;
+    const parsed = parseGrepCommand(cmd);
+    if (!parsed) return;
 
     const supportedExts = new Set(getSupportedExtensions());
-
-    // Check 1: Explicit file paths with supported extensions in the command
-    // Matches things like `grep pattern foo.ts`, `rg pattern src/lib.rs`
-    const fileExtRegex = /\S+(\.\w+)\b/g;
-    let match: RegExpExecArray | null;
-    const targetedExts: string[] = [];
-    while ((match = fileExtRegex.exec(cmd)) !== null) {
-      const ext = match[1].toLowerCase();
-      if (supportedExts.has(ext)) {
-        targetedExts.push(ext);
-      }
-    }
-
-    // Check 2: grep --include=*.ext patterns
-    const includeRegex = /--include[= ]["']?\*?(\.\w+)["']?/g;
-    while ((match = includeRegex.exec(cmd)) !== null) {
-      const ext = match[1].toLowerCase();
-      if (supportedExts.has(ext)) {
-        targetedExts.push(ext);
-      }
-    }
-
-    // Check 3: rg --type / -t flags for supported languages
     const rgTypeMap = getRgTypeMap();
-    const typeRegex = /(?:--type|(?:^|\s)-t)\s+(\w+)/g;
-    while ((match = typeRegex.exec(cmd)) !== null) {
-      const mapped = rgTypeMap[match[1].toLowerCase()];
+
+    // Collect targeted file extensions from flags and file arguments
+    const targetedExts: string[] = [];
+
+    // From explicit file path arguments
+    for (const filePath of parsed.files) {
+      const ext = extname(filePath).toLowerCase();
+      if (ext && supportedExts.has(ext)) {
+        targetedExts.push(ext);
+      }
+    }
+
+    // From --include=*.ext (grep)
+    for (const pattern of parsed.includeGlobs) {
+      const m = pattern.match(/\*?(\.\w+)$/);
+      if (m && supportedExts.has(m[1].toLowerCase())) {
+        targetedExts.push(m[1].toLowerCase());
+      }
+    }
+
+    // From --type/-t (rg)
+    for (const typeName of parsed.typeFilters) {
+      const mapped = rgTypeMap[typeName.toLowerCase()];
       if (mapped && supportedExts.has(mapped)) {
         targetedExts.push(mapped);
       }
     }
 
-    // Check 4: Structural keywords in the search pattern that indicate
-    // the LLM is searching for code structure, not literal text
+    // Check if the search pattern contains structural code keywords
     const structuralPatterns = [
-      /\b(def|function|func|fn|class|interface|type|struct|enum|trait|impl|module|mod|const|export|import|pub|private|protected|abstract|static|async)\b/,
+      /\b(def|function|func|fn|class|interface|type|struct|enum|trait|impl|module|mod|export|import|pub|private|protected|abstract)\b/,
       /\b(class|interface|type|struct|enum|trait)\s+\w/,
       /\b(def|function|func|fn)\s+\w/,
     ];
 
-    const isStructuralSearch = structuralPatterns.some((p) => p.test(cmd));
+    const isStructuralSearch = structuralPatterns.some((p) => p.test(parsed.pattern));
 
-    // Block if we found supported file types AND it looks structural,
-    // OR if it's a recursive search (no explicit files) with structural patterns
-    const isRecursive = /\s-[a-zA-Z]*r|--recursive|-R\b/.test(cmd) ||
-      grepMatch[1] === "rg"; // rg is recursive by default
-
+    // Block if targeting supported files AND the pattern is structural,
+    // OR if it's a recursive search with structural patterns
     const shouldBlock =
       (targetedExts.length > 0 && isStructuralSearch) ||
-      (isRecursive && isStructuralSearch);
+      (parsed.isRecursive && isStructuralSearch);
 
     if (shouldBlock) {
       return {
         block: true,
         reason:
-          `Use \`code_nav\` instead of \`${grepMatch[1]}\` for finding code structure (functions, classes, types, etc.). ` +
+          `Use \`code_nav\` instead of \`${parsed.tool}\` for finding code structure (functions, classes, types, etc.). ` +
           `code_nav uses tree-sitter for accurate structural analysis. ` +
           `Example: code_nav with action="symbols" and kind="function" to find functions, ` +
           `or action="outline" for a full structural overview. ` +
@@ -343,6 +336,178 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
   pi.on("session_shutdown", async () => {
     clearCache();
   });
+}
+
+// ─── Grep/rg command parsing ─────────────────────────────────────────────
+
+/** Flags that consume the next argument as a value (not a file path). */
+const GREP_VALUE_FLAGS = new Set([
+  // grep
+  "-e", "-f", "-m", "--max-count", "-A", "--after-context",
+  "-B", "--before-context", "-C", "--context", "--label",
+  "--color", "--colour", "--include", "--exclude", "--exclude-dir",
+  // rg
+  "-t", "--type", "-T", "--type-not", "-g", "--glob", "--iglob",
+  "-j", "--threads", "-M", "--max-columns", "--max-filesize",
+  "--max-depth", "--maxdepth", "-E", "--encoding",
+  "--sort", "--sortr", "--type-add", "--type-clear",
+  "--colors", "--context-separator", "--field-match-separator",
+  "--path-separator", "-r", "--replace", "--pre", "--pre-glob",
+  "--after-context", "--before-context",
+]);
+
+interface ParsedGrepCommand {
+  tool: "grep" | "rg" | "ripgrep";
+  pattern: string;
+  files: string[];
+  flags: string[];
+  includeGlobs: string[];
+  typeFilters: string[];
+  isRecursive: boolean;
+}
+
+/**
+ * Parse a shell command string to extract grep/rg invocation details.
+ * Returns null if the command doesn't contain a grep/rg call.
+ *
+ * For pipelines and compound commands, checks each sub-command.
+ */
+function parseGrepCommand(cmd: string): ParsedGrepCommand | null {
+  const tokens = parseShell(cmd);
+
+  // Flatten tokens — shell-quote returns strings, operators ({op: '|'}),
+  // and globs ({op: 'glob', pattern: '...'}) for unquoted wildcards.
+  const args: string[] = [];
+  for (const token of tokens) {
+    if (typeof token === "string") {
+      args.push(token);
+    } else if (typeof token === "object" && token !== null) {
+      if ("pattern" in token) {
+        // Glob token (e.g. --include=*.py unquoted) — treat as a string arg
+        args.push(String(token.pattern));
+      } else if ("op" in token) {
+        // Pipe, semicolon, &&, || — treat as command boundary
+        const result = tryParseGrepArgs(args);
+        if (result) return result;
+        args.length = 0;
+      }
+    }
+  }
+
+  // Check the last (or only) segment
+  return tryParseGrepArgs(args);
+}
+
+/** Try to parse an argument list as a grep/rg invocation. */
+function tryParseGrepArgs(args: string[]): ParsedGrepCommand | null {
+  // Find the grep/rg binary — could be a path like /usr/bin/grep
+  const toolIdx = args.findIndex((a) => /^(.*\/)?(grep|rg|ripgrep)$/.test(a));
+  if (toolIdx === -1) return null;
+
+  const toolBin = args[toolIdx];
+  const tool = toolBin.endsWith("grep") ? "grep" as const
+    : toolBin.endsWith("ripgrep") ? "ripgrep" as const
+    : "rg" as const;
+
+  const rest = args.slice(toolIdx + 1);
+
+  const flags: string[] = [];
+  const files: string[] = [];
+  const includeGlobs: string[] = [];
+  const typeFilters: string[] = [];
+  const explicitPatterns: string[] = [];
+  let isRecursive = tool === "rg"; // rg is recursive by default
+  let patternConsumed = false;
+
+  let i = 0;
+  while (i < rest.length) {
+    const arg = rest[i];
+
+    if (arg === "--") {
+      // Everything after -- is file paths
+      files.push(...rest.slice(i + 1));
+      break;
+    }
+
+    if (arg.startsWith("-")) {
+      flags.push(arg);
+
+      // Check for recursive flags
+      if (arg === "-r" || arg === "-R" || arg === "--recursive") {
+        isRecursive = true;
+      }
+      // Short flags can be combined: -rn, -rin, etc.
+      if (/^-[a-zA-Z]*[rR][a-zA-Z]*$/.test(arg) && !arg.startsWith("--")) {
+        isRecursive = true;
+      }
+
+      // Handle --flag=value style
+      const eqIdx = arg.indexOf("=");
+      if (eqIdx !== -1) {
+        const flagName = arg.slice(0, eqIdx);
+        const flagValue = arg.slice(eqIdx + 1);
+
+        if (flagName === "--include") {
+          includeGlobs.push(flagValue);
+        } else if (flagName === "--type" || flagName === "-t") {
+          typeFilters.push(flagValue);
+        } else if (flagName === "-e" || flagName === "--regexp") {
+          explicitPatterns.push(flagValue);
+        }
+        i++;
+        continue;
+      }
+
+      // Handle -e / --regexp (explicit pattern, can appear multiple times)
+      if (arg === "-e" || arg === "--regexp") {
+        if (i + 1 < rest.length) {
+          explicitPatterns.push(rest[i + 1]);
+          i += 2;
+          continue;
+        }
+      }
+
+      // Handle --include (grep)
+      if (arg === "--include") {
+        if (i + 1 < rest.length) {
+          includeGlobs.push(rest[i + 1]);
+          i += 2;
+          continue;
+        }
+      }
+
+      // Handle --type / -t (rg)
+      if (arg === "--type" || arg === "-t") {
+        if (i + 1 < rest.length) {
+          typeFilters.push(rest[i + 1]);
+          i += 2;
+          continue;
+        }
+      }
+
+      // Check if this flag consumes the next arg as a value
+      if (GREP_VALUE_FLAGS.has(arg)) {
+        i += 2; // skip flag + its value
+        continue;
+      }
+
+      i++;
+      continue;
+    }
+
+    // Positional argument: first one is the pattern, rest are files
+    if (!patternConsumed && explicitPatterns.length === 0) {
+      patternConsumed = true;
+      explicitPatterns.push(arg);
+    } else {
+      files.push(arg);
+    }
+    i++;
+  }
+
+  const pattern = explicitPatterns.join(" ");
+
+  return { tool, pattern, files, flags, includeGlobs, typeFilters, isRecursive };
 }
 
 // ─── Directory scanning ─────────────────────────────────────────────────

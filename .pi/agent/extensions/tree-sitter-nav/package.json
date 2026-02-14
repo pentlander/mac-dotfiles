@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@tree-sitter-grammars/tree-sitter-hcl": "^1.2.0",
+    "@types/shell-quote": "^1.7.5",
+    "shell-quote": "^1.8.3",
     "tree-sitter-wasms": "^0.1.13",
     "web-tree-sitter": "^0.22.6"
   }
