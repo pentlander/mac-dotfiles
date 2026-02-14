@@ -253,6 +253,14 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
     },
   });
 
+  // Instruct the LLM to prefer code_nav over grep for structural navigation
+  pi.on("before_agent_start", async (event) => {
+    const instruction = `\n\n**IMPORTANT: ALWAYS use \`code_nav\` as the FIRST tool for exploring code structure** (finding symbols, types, interfaces, functions, classes, enums, methods, etc.). For single files, \`code_nav\` shows all nested symbols. For directories, it shows top-level symbols — if you need inner/nested symbols, call \`code_nav\` on the specific file. Use \`grep\` ONLY for literal text/string search, NEVER for structural code navigation.`;
+    return {
+      systemPrompt: event.systemPrompt + instruction,
+    };
+  });
+
   // Clean up on shutdown
   pi.on("session_shutdown", async () => {
     clearCache();
