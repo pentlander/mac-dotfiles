@@ -108,6 +108,31 @@ export function getSupportedExtensions(): string[] {
   return Object.keys(EXTENSION_MAP);
 }
 
+/**
+ * Map from ripgrep type names (e.g. "ts", "rust", "py") to file extensions.
+ * Derived from EXTENSION_MAP — includes both the grammar name and common short aliases.
+ */
+export function getRgTypeMap(): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const [ext, info] of Object.entries(EXTENSION_MAP)) {
+    // Map grammar name → first extension (e.g. "typescript" → ".ts")
+    if (!map[info.grammar]) {
+      map[info.grammar] = ext;
+    }
+    // Map human-readable name lowercase → first extension (e.g. "typescript" → ".ts")
+    const nameLower = info.name.toLowerCase();
+    if (!map[nameLower]) {
+      map[nameLower] = ext;
+    }
+    // Map bare extension without dot as alias (e.g. "ts" → ".ts", "py" → ".py")
+    const bare = ext.slice(1);
+    if (!map[bare]) {
+      map[bare] = ext;
+    }
+  }
+  return map;
+}
+
 /** Resolve the path to a .wasm grammar file. */
 export function getWasmPath(lang: LanguageInfo): string {
   if (lang.source === "hcl") {

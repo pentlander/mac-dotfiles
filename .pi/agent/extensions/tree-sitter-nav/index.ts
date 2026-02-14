@@ -31,7 +31,7 @@ import {
   type SymbolInfo,
   type ExtractOptions,
 } from "./symbols.js";
-import { getLanguageForExtension, getSupportedExtensions } from "./languages.js";
+import { getLanguageForExtension, getSupportedExtensions, getRgTypeMap } from "./languages.js";
 
 const CodeNavParams = Type.Object({
   path: Type.String({ description: "File or directory path to analyze" }),
@@ -298,16 +298,7 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
     }
 
     // Check 3: rg --type / -t flags for supported languages
-    const rgTypeMap: Record<string, string> = {
-      ts: ".ts", typescript: ".ts", js: ".js", javascript: ".js",
-      py: ".py", python: ".py", rs: ".rs", rust: ".rs",
-      go: ".go", java: ".java", kt: ".kt", kotlin: ".kt",
-      swift: ".swift", rb: ".rb", ruby: ".rb", php: ".php",
-      cs: ".cs", scala: ".scala", lua: ".lua", sh: ".sh",
-      bash: ".sh", zig: ".zig", elixir: ".ex", dart: ".dart",
-      ocaml: ".ml", yaml: ".yaml", toml: ".toml", hcl: ".hcl",
-      terraform: ".tf", tf: ".tf",
-    };
+    const rgTypeMap = getRgTypeMap();
     const typeRegex = /(?:--type|(?:^|\s)-t)\s+(\w+)/g;
     while ((match = typeRegex.exec(cmd)) !== null) {
       const mapped = rgTypeMap[match[1].toLowerCase()];
