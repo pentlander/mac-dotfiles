@@ -69,23 +69,9 @@ for ext_dir in "$HOME"/.pi/agent/extensions/*/; do
     fi
 done
 
-# ── Fish shell ──────────────────────────────────────────────────────────────
-section "Fish shell"
-FISH_PATH="/opt/homebrew/bin/fish"
-if ! grep -qx "$FISH_PATH" /etc/shells 2>/dev/null; then
-    echo "Adding fish to /etc/shells…"
-    echo "$FISH_PATH" | sudo tee -a /etc/shells
-fi
-if [ "$SHELL" != "$FISH_PATH" ]; then
-    echo "Setting fish as default shell…"
-    chsh -s "$FISH_PATH"
-else
-    echo "Fish is already the default shell"
-fi
-
 # ── Done ────────────────────────────────────────────────────────────────────
 section "Done!"
-echo "All set. Open a new terminal (Ghostty) to start using your setup."
+echo "All set. Open a new terminal (Ghostty) to start using fish via Ghostty's config."
 echo ""
 echo "Remaining manual steps:"
 echo "  • Run 'pi' and authenticate with your provider"

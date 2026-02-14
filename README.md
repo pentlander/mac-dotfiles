@@ -21,7 +21,8 @@ The setup script will:
 3. Install **mise** runtimes (Node, Go, etc.)
 4. Install **Rust** via rustup (if missing)
 5. Install **pi** coding agent and its extension dependencies
-6. Set **fish** as the default shell
+
+Fish is launched by Ghostty (`command = /opt/homebrew/bin/fish` in the Ghostty config) rather than via `chsh`, to avoid POSIX compatibility issues.
 
 ## After editing
 
