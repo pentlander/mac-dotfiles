@@ -1,0 +1,16 @@
+{
+  "name": "pi-extension-tree-sitter-nav",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@tree-sitter-grammars/tree-sitter-hcl": "^1.2.0",
+    "tree-sitter-wasms": "^0.1.13",
+    "web-tree-sitter": "^0.22.6"
+  }
+}
