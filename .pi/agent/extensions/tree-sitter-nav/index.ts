@@ -257,7 +257,7 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
 
   // Instruct the LLM to prefer code_nav over grep for structural navigation
   pi.on("before_agent_start", async (event) => {
-    const instruction = `\n\n**IMPORTANT: ALWAYS use \`code_nav\` as the FIRST tool for exploring code structure** (finding symbols, types, interfaces, functions, classes, enums, methods, etc.). For single files, \`code_nav\` shows all nested symbols. For directories, it shows top-level symbols — if you need inner/nested symbols, call \`code_nav\` on the specific file. Use \`grep\` ONLY for literal text/string search, NEVER for structural code navigation.`;
+    const instruction = `\n\n**IMPORTANT: ALWAYS use \`code_nav\` as the FIRST tool for exploring code structure** (finding symbols, types, interfaces, functions, classes, enums, methods, etc.). For single files, \`code_nav\` shows all nested symbols. For directories, it shows top-level symbols — if you need inner/nested symbols, call \`code_nav\` on the specific file. Structural grep/rg searches on code files (patterns containing keywords like function, class, def, struct, impl, trait, type, interface, enum, etc.) are BLOCKED and will fail. Use \`code_nav\` for structure, \`read\` for file contents, and \`grep\`/\`rg\` only for literal text searches (config values, error strings, TODOs, etc.).`;
     return {
       systemPrompt: event.systemPrompt + instruction,
     };
@@ -323,11 +323,11 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
       return {
         block: true,
         reason:
-          `Use \`code_nav\` instead of \`${parsed.tool}\` for finding code structure (functions, classes, types, etc.). ` +
-          `code_nav uses tree-sitter for accurate structural analysis. ` +
-          `Example: code_nav with action="symbols" and kind="function" to find functions, ` +
-          `or action="outline" for a full structural overview. ` +
-          `Use grep/rg only for literal text search (strings, error messages, comments, etc.).`,
+          `BLOCKED: Do NOT use \`${parsed.tool}\` on code files. You MUST use \`code_nav\` instead. ` +
+          `This is not a suggestion — grep/rg on code files is disabled. ` +
+          `Use code_nav with action="outline" to explore structure, action="symbols" with kind= to filter, ` +
+          `or \`read\` to examine specific files. ` +
+          `grep/rg is ONLY for non-code files (logs, .txt, .csv, .env, etc.) or piped output.`,
       };
     }
   });
