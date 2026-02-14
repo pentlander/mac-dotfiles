@@ -255,9 +255,241 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
     },
   });
 
+  // ── find_identifiers tool ──────────────────────────────────────────────
+
+  const FindIdentifiersParams = Type.Object({
+    name: Type.String({ description: "Identifier name to search for (exact match)" }),
+    path: Type.String({ description: "File or directory to search in" }),
+    context: Type.Optional(
+      Type.Number({ description: "Number of lines of context to show before and after each match (default: 0)" })
+    ),
+  });
+
+  // Node types that represent identifiers across grammars
+  const IDENTIFIER_TYPES = new Set([
+    // JS/TS
+    "identifier", "type_identifier", "property_identifier", "shorthand_property_identifier",
+    "shorthand_property_identifier_pattern",
+    // Rust
+    "field_identifier", "scoped_identifier",
+    // Go
+    "field_identifier", "package_identifier",
+    // Python
+    "attribute",
+    // General
+    "simple_identifier", // Kotlin
+    "name", "qualified_name",
+    // Ruby
+    "constant", "symbol",
+  ]);
+
+  interface IdentifierMatch {
+    file: string;
+    line: number;
+    col: number;
+    lineText: string;
+    nodeType: string;
+    parentType: string;
+    sourceLines: string[];
+  }
+
+  function findIdentifiersInTree(
+    tree: ReturnType<typeof import("web-tree-sitter").default.prototype.parse>,
+    name: string,
+    source: string,
+    filePath: string,
+  ): IdentifierMatch[] {
+    const matches: IdentifierMatch[] = [];
+    const sourceLines = source.split("\n");
+
+    function walk(node: { type: string; text: string; startPosition: { row: number; column: number }; parent: any; childCount: number; child: (i: number) => any; isNamed: boolean }) {
+      if (IDENTIFIER_TYPES.has(node.type) && node.text === name) {
+        const line = node.startPosition.row;
+        matches.push({
+          file: filePath,
+          line: line + 1,
+          col: node.startPosition.column + 1,
+          lineText: sourceLines[line]?.trimEnd() ?? "",
+          nodeType: node.type,
+          parentType: node.parent?.type ?? "root",
+          sourceLines,
+        });
+      }
+
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (child && child.isNamed) walk(child);
+      }
+    }
+
+    walk(tree.rootNode as any);
+    return matches;
+  }
+
+  pi.registerTool({
+    name: "find_identifiers",
+    label: "Find Identifiers",
+    description: `Find all occurrences of an identifier name in code files using tree-sitter AST parsing. Unlike grep, this only matches actual identifier nodes — it skips strings, comments, and partial matches within other names. Searches a single file or recursively through a directory (max ${MAX_DIR_FILES} files). Not scope-aware: returns all identifiers with the given name regardless of scope.`,
+    parameters: FindIdentifiersParams,
+
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const rawPath = params.path.replace(/^@/, "");
+      const absPath = resolve(ctx.cwd, rawPath);
+      const start = performance.now();
+
+      let stat: ReturnType<typeof statSync>;
+      try {
+        stat = statSync(absPath);
+      } catch {
+        return {
+          content: [{ type: "text", text: `Path not found: ${rawPath}` }],
+          isError: true,
+          details: {},
+        };
+      }
+
+      const allMatches: IdentifierMatch[] = [];
+
+      if (stat.isDirectory()) {
+        const supportedExts = new Set(getSupportedExtensions());
+        const files = collectFiles(absPath, supportedExts, MAX_DIR_FILES);
+
+        for (const file of files.found) {
+          if (signal?.aborted) break;
+          try {
+            const { tree, source } = await parseFile(file, ctx.cwd);
+            const relPath = relative(ctx.cwd, file);
+            allMatches.push(...findIdentifiersInTree(tree, params.name, source, relPath));
+          } catch {
+            // skip unparseable files
+          }
+        }
+      } else {
+        try {
+          const { tree, source } = await parseFile(absPath, ctx.cwd);
+          const relPath = relative(ctx.cwd, absPath);
+          allMatches.push(...findIdentifiersInTree(tree, params.name, source, relPath));
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text", text: message }],
+            isError: true,
+            details: {},
+          };
+        }
+      }
+
+      const elapsed = Math.round(performance.now() - start);
+
+      if (allMatches.length === 0) {
+        return {
+          content: [{ type: "text", text: `No occurrences of "${params.name}" found in ${rawPath}` }],
+          details: { name: params.name, path: rawPath, count: 0, timeMs: elapsed },
+        };
+      }
+
+      // Format output
+      const ctx_lines = params.context ?? 0;
+      const lines: string[] = [];
+      let currentFile = "";
+      for (const m of allMatches) {
+        if (m.file !== currentFile) {
+          if (currentFile) lines.push("");
+          lines.push(m.file);
+          currentFile = m.file;
+        }
+
+        if (ctx_lines > 0) {
+          const startLine = Math.max(0, m.line - 1 - ctx_lines);
+          const endLine = Math.min(m.sourceLines.length, m.line + ctx_lines);
+          if (lines[lines.length - 1] !== m.file) lines.push("  --");
+          for (let i = startLine; i < endLine; i++) {
+            const lineNum = i + 1;
+            const marker = lineNum === m.line ? ">" : " ";
+            lines.push(`${marker} ${lineNum}:  ${m.sourceLines[i]?.trimEnd() ?? ""}`);
+          }
+        } else {
+          lines.push(`  ${m.line}:${m.col}  ${m.lineText}`);
+        }
+      }
+
+      const output = lines.join("\n");
+      const truncation = truncateHead(output, {
+        maxLines: DEFAULT_MAX_LINES,
+        maxBytes: DEFAULT_MAX_BYTES,
+      });
+
+      let resultText = truncation.content;
+      if (truncation.truncated) {
+        resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines]`;
+      }
+
+      const details = {
+        name: params.name,
+        path: rawPath,
+        count: allMatches.length,
+        fileCount: new Set(allMatches.map((m) => m.file)).size,
+        timeMs: elapsed,
+        truncated: truncation.truncated,
+      };
+
+      return {
+        content: [{ type: "text", text: resultText }],
+        details,
+      };
+    },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("find_identifiers "));
+      text += theme.fg("accent", `"${args.name}"`);
+      text += " " + theme.fg("muted", args.path);
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, { expanded }, theme) {
+      const details = result.details as { count?: number; fileCount?: number; timeMs?: number; truncated?: boolean } | undefined;
+
+      if (result.isError) {
+        const errText = result.content[0];
+        return new Text(theme.fg("error", errText?.type === "text" ? errText.text : "Error"), 0, 0);
+      }
+
+      if (!details || details.count === 0) {
+        return new Text(theme.fg("dim", "No matches"), 0, 0);
+      }
+
+      let text = theme.fg("success", `${details.count} occurrences`);
+      if (details.fileCount && details.fileCount > 1) {
+        text += theme.fg("dim", ` across ${details.fileCount} files`);
+      }
+      if (details.timeMs !== undefined) {
+        text += theme.fg("dim", ` ${details.timeMs}ms`);
+      }
+      if (details.truncated) {
+        text += " " + theme.fg("warning", "(truncated)");
+      }
+
+      if (expanded) {
+        const content = result.content[0];
+        if (content?.type === "text") {
+          const lines = content.text.split("\n").slice(0, 30);
+          for (const line of lines) {
+            text += "\n" + theme.fg("dim", line);
+          }
+          const totalLines = content.text.split("\n").length;
+          if (totalLines > 30) {
+            text += `\n${theme.fg("muted", `... ${totalLines - 30} more lines`)}`;
+          }
+        }
+      }
+
+      return new Text(text, 0, 0);
+    },
+  });
+
   // Instruct the LLM to prefer code_nav over grep for structural navigation
   pi.on("before_agent_start", async (event) => {
-    const instruction = `\n\n**IMPORTANT: ALWAYS use \`code_nav\` as the FIRST tool for exploring code structure** (finding symbols, types, interfaces, functions, classes, enums, methods, etc.). For single files, \`code_nav\` shows all nested symbols. For directories, it shows top-level symbols — if you need inner/nested symbols, call \`code_nav\` on the specific file. Structural grep/rg searches on code files (patterns containing keywords like function, class, def, struct, impl, trait, type, interface, enum, etc.) are BLOCKED and will fail. Use \`code_nav\` for structure, \`read\` for file contents, and \`grep\`/\`rg\` only for literal text searches (config values, error strings, TODOs, etc.).`;
+    const instruction = `\n\n**IMPORTANT: ALWAYS use \`code_nav\` as the FIRST tool for exploring code structure** (finding symbols, types, interfaces, functions, classes, enums, methods, etc.). For single files, \`code_nav\` shows all nested symbols. For directories, it shows top-level symbols — if you need inner/nested symbols, call \`code_nav\` on the specific file. Use \`find_identifiers\` to find all occurrences of a name across files (like find-references but not scope-aware — skips strings and comments, exact identifier match only). Structural grep/rg searches on code files (patterns containing keywords like function, class, def, struct, impl, trait, type, interface, enum, etc.) are BLOCKED and will fail. Use \`code_nav\` for structure, \`find_identifiers\` for usage search, \`read\` for file contents, and \`grep\`/\`rg\` only for literal text searches (config values, error strings, TODOs, etc.).`;
     return {
       systemPrompt: event.systemPrompt + instruction,
     };
