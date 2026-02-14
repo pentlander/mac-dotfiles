@@ -15,6 +15,7 @@ import {
   DEFAULT_MAX_LINES,
   formatSize,
   truncateHead,
+  isToolCallEventType,
 } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text } from "@mariozechner/pi-tui";
@@ -259,6 +260,92 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
     return {
       systemPrompt: event.systemPrompt + instruction,
     };
+  });
+
+  // Intercept bash calls that use grep/rg for structural code navigation
+  // on file types we support, and block them with a suggestion to use code_nav.
+  pi.on("tool_call", async (event) => {
+    if (!isToolCallEventType("bash", event)) return;
+
+    const cmd = event.input.command;
+    if (!cmd) return;
+
+    // Check if the command uses grep or rg
+    const grepMatch = cmd.match(/\b(grep|rg|ripgrep)\b/);
+    if (!grepMatch) return;
+
+    const supportedExts = new Set(getSupportedExtensions());
+
+    // Check 1: Explicit file paths with supported extensions in the command
+    // Matches things like `grep pattern foo.ts`, `rg pattern src/lib.rs`
+    const fileExtRegex = /\S+(\.\w+)\b/g;
+    let match: RegExpExecArray | null;
+    const targetedExts: string[] = [];
+    while ((match = fileExtRegex.exec(cmd)) !== null) {
+      const ext = match[1].toLowerCase();
+      if (supportedExts.has(ext)) {
+        targetedExts.push(ext);
+      }
+    }
+
+    // Check 2: grep --include=*.ext patterns
+    const includeRegex = /--include[= ]["']?\*?(\.\w+)["']?/g;
+    while ((match = includeRegex.exec(cmd)) !== null) {
+      const ext = match[1].toLowerCase();
+      if (supportedExts.has(ext)) {
+        targetedExts.push(ext);
+      }
+    }
+
+    // Check 3: rg --type / -t flags for supported languages
+    const rgTypeMap: Record<string, string> = {
+      ts: ".ts", typescript: ".ts", js: ".js", javascript: ".js",
+      py: ".py", python: ".py", rs: ".rs", rust: ".rs",
+      go: ".go", java: ".java", kt: ".kt", kotlin: ".kt",
+      swift: ".swift", rb: ".rb", ruby: ".rb", php: ".php",
+      cs: ".cs", scala: ".scala", lua: ".lua", sh: ".sh",
+      bash: ".sh", zig: ".zig", elixir: ".ex", dart: ".dart",
+      ocaml: ".ml", yaml: ".yaml", toml: ".toml", hcl: ".hcl",
+      terraform: ".tf", tf: ".tf",
+    };
+    const typeRegex = /(?:--type|(?:^|\s)-t)\s+(\w+)/g;
+    while ((match = typeRegex.exec(cmd)) !== null) {
+      const mapped = rgTypeMap[match[1].toLowerCase()];
+      if (mapped && supportedExts.has(mapped)) {
+        targetedExts.push(mapped);
+      }
+    }
+
+    // Check 4: Structural keywords in the search pattern that indicate
+    // the LLM is searching for code structure, not literal text
+    const structuralPatterns = [
+      /\b(def|function|func|fn|class|interface|type|struct|enum|trait|impl|module|mod|const|export|import|pub|private|protected|abstract|static|async)\b/,
+      /\b(class|interface|type|struct|enum|trait)\s+\w/,
+      /\b(def|function|func|fn)\s+\w/,
+    ];
+
+    const isStructuralSearch = structuralPatterns.some((p) => p.test(cmd));
+
+    // Block if we found supported file types AND it looks structural,
+    // OR if it's a recursive search (no explicit files) with structural patterns
+    const isRecursive = /\s-[a-zA-Z]*r|--recursive|-R\b/.test(cmd) ||
+      grepMatch[1] === "rg"; // rg is recursive by default
+
+    const shouldBlock =
+      (targetedExts.length > 0 && isStructuralSearch) ||
+      (isRecursive && isStructuralSearch);
+
+    if (shouldBlock) {
+      return {
+        block: true,
+        reason:
+          `Use \`code_nav\` instead of \`${grepMatch[1]}\` for finding code structure (functions, classes, types, etc.). ` +
+          `code_nav uses tree-sitter for accurate structural analysis. ` +
+          `Example: code_nav with action="symbols" and kind="function" to find functions, ` +
+          `or action="outline" for a full structural overview. ` +
+          `Use grep/rg only for literal text search (strings, error messages, comments, etc.).`,
+      };
+    }
   });
 
   // Clean up on shutdown
