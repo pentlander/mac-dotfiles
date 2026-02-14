@@ -118,11 +118,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		handler: async (ctx) => togglePlanMode(ctx),
 	});
 
-	pi.registerShortcut("shift+tab", {
-		description: "Toggle plan mode",
-		handler: async (ctx) => togglePlanMode(ctx),
-	});
-
 	// Block destructive bash commands in plan mode
 	pi.on("tool_call", async (event) => {
 		if (!planModeEnabled || event.toolName !== "bash") return;
