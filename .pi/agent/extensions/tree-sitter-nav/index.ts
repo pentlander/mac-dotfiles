@@ -22,6 +22,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { resolve, extname, relative, sep } from "node:path";
 import { readdirSync, statSync } from "node:fs";
+import { execFile } from "node:child_process";
 
 import { parseFile, clearCache } from "./parser.js";
 import {

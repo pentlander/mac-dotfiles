@@ -1,2 +1,9 @@
 theme = "Monokai Soda"
 command = /opt/homebrew/bin/fish
+clipboard-paste-protection = false
+
+window-padding-balance = true
+window-padding-x = 4
+window-padding-y = 4
+
+keybind = global:cmd+;=toggle_quick_terminal
