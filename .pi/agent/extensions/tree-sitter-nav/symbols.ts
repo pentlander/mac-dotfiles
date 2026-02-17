@@ -693,6 +693,8 @@ export interface ExtractOptions {
   signatures?: boolean;
   /** Filter by symbol kind */
   kind?: string;
+  /** Regex pattern to filter symbols by name */
+  namePattern?: string;
   /** Only extract top-level symbols (for directory scanning) */
   topLevelOnly?: boolean;
   /** Maximum depth for YAML/TOML/HCL nesting (default: 2 for dir scans, unlimited otherwise) */
@@ -714,12 +716,22 @@ export function extractSymbols(
   const symbols: SymbolInfo[] = [];
   walkNode(tree.rootNode, spec, source, symbols, options, 0);
 
+  let result = symbols;
+
   // Apply kind filter
   if (options.kind) {
-    return filterByKind(symbols, options.kind);
+    result = filterByKind(result, options.kind);
   }
 
-  return symbols;
+  // Apply name pattern filter
+  if (options.namePattern) {
+    // Strip inline flags like (?i) — we already apply case-insensitive
+    const cleaned = options.namePattern.replace(/\(\?[imsu]+\)/g, "");
+    const re = new RegExp(cleaned, "i");
+    result = filterByName(result, re);
+  }
+
+  return result;
 }
 
 function walkNode(
@@ -878,6 +890,24 @@ function filterByKind(symbols: SymbolInfo[], kind: string): SymbolInfo[] {
       const filtered = filterByKind(sym.children, kind);
       if (filtered.length > 0) {
         result.push(...filtered);
+      }
+    }
+  }
+  return result;
+}
+
+function filterByName(symbols: SymbolInfo[], re: RegExp): SymbolInfo[] {
+  const result: SymbolInfo[] = [];
+  for (const sym of symbols) {
+    if (re.test(sym.name)) {
+      // Symbol matches — include it with all its children
+      result.push(sym);
+    } else if (sym.children.length > 0) {
+      // Symbol doesn't match — but check children
+      const filtered = filterByName(sym.children, re);
+      if (filtered.length > 0) {
+        // Include parent as container with only matching descendants
+        result.push({ ...sym, children: filtered });
       }
     }
   }

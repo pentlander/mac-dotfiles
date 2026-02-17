@@ -47,6 +47,23 @@ if status is-interactive
     abbr -a glg 'git log --stat --max-count 10'
     abbr -a grhh 'git reset --hard HEAD'
 
+    abbr -a j 'jj'
+    abbr -a jn 'jj new'
+    abbr -a jd 'jj diff'
+    abbr -a jds 'jj describe -m'
+    abbr -a je 'jj edit'
+    abbr -a jl 'jj log'
+    abbr -a jlt 'jj log -r "trunk()..@"'
+    abbr -a js 'jj squash'
+    abbr -a jsi 'jj split'
+    abbr -a jab 'jj absorb'
+    abbr -a jgf 'jj git fetch'
+    abbr -a jgp 'jj git push'
+    abbr -a jrb 'jj rebase'
+    abbr -a ju 'jj undo'
+    abbr -a jst 'jj status'
+    abbr -a jbs --set-cursor "jj bookmark set '%' -r @"
+
     abbr -a st 'stacked'
     abbr -a stca --set-cursor "stacked create -a '%'"
     abbr -a stsn "stacked sync"

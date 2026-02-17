@@ -353,7 +353,7 @@ export default function (pi: ExtensionAPI) {
     name: "jb_symbol",
     label: "JB Symbol",
     description:
-      'Get symbol information from JetBrains IDE at a file position. Returns definition location and type signature by default. Add "docs" to include for full documentation (verbose).',
+      'Get symbol information from JetBrains IDE at a file position. Use this to jump to definitions when tracing through code — when you see a method call, variable, or type and need to find where it\'s defined, use this instead of searching. Returns definition location and type signature by default. Add "docs" to include for full documentation (verbose).',
     parameters: Type.Object({
       file: Type.String({ description: "File path relative to project root" }),
       line: Type.Number({ description: "1-based line number" }),

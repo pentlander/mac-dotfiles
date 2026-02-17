@@ -48,6 +48,11 @@ const CodeNavParams = Type.Object({
         'Filter by symbol kind: "function", "method", "class", "interface", "type", "enum", "struct", "trait", "impl", "module", "variable", "constant", "property", "resource", "data", "block"',
     }),
   ),
+  namePattern: Type.Optional(
+    Type.String({
+      description: "Regex pattern to filter symbols by name (e.g. \"^Get\" or \"Handler$\" or \"usage.*report\"). Already case-insensitive — do NOT use (?i) inline flags.",
+    }),
+  ),
   signatures: Type.Optional(
     Type.Boolean({
       description: "Include function/method signatures with parameter types (default: false)",
@@ -67,6 +72,7 @@ interface CodeNavDetails {
 }
 
 const MAX_DIR_FILES = 200;
+const MAX_DIR_FILES_FILTERED = 10000;
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
@@ -75,10 +81,11 @@ export default function (pi: ExtensionAPI) {
     description: `Analyze code structure using tree-sitter. Extract symbols (functions, classes, methods, types, etc.) from source files.
 
 For a single file: returns all symbols with line numbers and optional signatures.
-For a directory: returns top-level symbols across all supported files (max ${MAX_DIR_FILES} files).
+For a directory: returns top-level symbols across all supported files (max ${MAX_DIR_FILES} files, or ${MAX_DIR_FILES_FILTERED} when filtering by kind or namePattern).
 
 Use "outline" action (default) for a hierarchical tree view — best for exploring structure, understanding a file or project layout, and navigating to specific code sections.
 Use "symbols" action for a flat list — best when filtering by kind (e.g. kind="method") or when you need a compact scannable list of definitions.
+Use "namePattern" to filter symbols by regex (e.g. namePattern="Handler$" or namePattern="(?i)usage"). Applies to both actions.
 Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.
 
 Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, PHP, C#, Scala, Lua, Bash, Zig, Elixir, Dart, OCaml, YAML, TOML, HCL, Terraform.`,
@@ -107,7 +114,7 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
       let details: CodeNavDetails;
 
       if (stat.isDirectory()) {
-        const result = await processDirectory(absPath, ctx.cwd, action, showSigs, signal);
+        const result = await processDirectory(absPath, ctx.cwd, action, showSigs, signal, params.kind, params.namePattern);
         output = result.output;
         details = {
           path: rawPath,
@@ -119,7 +126,8 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
         };
 
         if (result.skipped > 0) {
-          output += `\n\n[Scanned ${result.fileCount} of ${result.fileCount + result.skipped} supported files. ${result.skipped} files skipped (limit: ${MAX_DIR_FILES}). Narrow the path to see more.]`;
+          const limit = (params.kind || params.namePattern) ? MAX_DIR_FILES_FILTERED : MAX_DIR_FILES;
+          output += `\n\n[Scanned ${result.fileCount} of ${result.fileCount + result.skipped} supported files. ${result.skipped} files skipped (limit: ${limit}). Narrow the path to see more.]`;
         }
       } else {
         try {
@@ -128,6 +136,7 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
           const opts: ExtractOptions = {
             signatures: showSigs,
             kind: params.kind,
+            namePattern: params.namePattern,
           };
 
           const symbols = extractSymbols(tree, language.grammar, source, opts);
@@ -138,8 +147,9 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
               : formatSymbols(symbols, showSigs);
 
           if (!output.trim()) {
-            output = params.kind
-              ? `No "${params.kind}" symbols found in ${rawPath}`
+            const filters = [params.kind && `kind="${params.kind}"`, params.namePattern && `namePattern="${params.namePattern}"`].filter(Boolean).join(", ");
+            output = filters
+              ? `No symbols matching ${filters} found in ${rawPath}`
               : `No symbols found in ${rawPath}`;
           }
 
@@ -191,6 +201,9 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
       text += " " + theme.fg("muted", args.path);
       if (args.kind) {
         text += theme.fg("dim", ` --kind=${args.kind}`);
+      }
+      if (args.namePattern) {
+        text += theme.fg("dim", ` --name=${args.namePattern}`);
       }
       if (args.signatures) {
         text += theme.fg("dim", " --signatures");
@@ -705,9 +718,13 @@ async function processDirectory(
   action: string,
   showSigs: boolean,
   signal?: AbortSignal,
+  kind?: string,
+  namePattern?: string,
 ): Promise<DirResult> {
   const supportedExts = new Set(getSupportedExtensions());
-  const files = collectFiles(absDir, supportedExts, MAX_DIR_FILES);
+  const hasFilter = !!(kind || namePattern);
+  const fileLimit = hasFilter ? MAX_DIR_FILES_FILTERED : MAX_DIR_FILES;
+  const files = collectFiles(absDir, supportedExts, fileLimit);
 
   const sections: string[] = [];
   let totalSymbols = 0;
@@ -723,6 +740,8 @@ async function processDirectory(
         signatures: showSigs,
         topLevelOnly: true,
         maxDepth: 2,
+        kind,
+        namePattern,
       };
 
       const symbols = extractSymbols(tree, language.grammar, source, opts);
