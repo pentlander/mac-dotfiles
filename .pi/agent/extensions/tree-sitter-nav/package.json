@@ -8,17 +8,9 @@
       "./index.ts"
     ]
   },
-  "scripts": {
-    "test": "node --preserve-symlinks --preserve-symlinks-main --import tsx/esm grep-parser.test.ts"
-  },
   "dependencies": {
     "@tree-sitter-grammars/tree-sitter-hcl": "^1.2.0",
-    "@types/shell-quote": "^1.7.5",
-    "shell-quote": "^1.8.3",
     "tree-sitter-wasms": "^0.1.13",
     "web-tree-sitter": "^0.22.6"
-  },
-  "devDependencies": {
-    "tsx": "^4.21.0"
   }
 }

@@ -32,8 +32,7 @@ import {
   type SymbolInfo,
   type ExtractOptions,
 } from "./symbols.js";
-import { getLanguageForExtension, getSupportedExtensions, getRgTypeMap } from "./languages.js";
-import { parse as parseShell } from "shell-quote";
+import { getLanguageForExtension, getSupportedExtensions } from "./languages.js";
 
 const CodeNavParams = Type.Object({
   path: Type.String({ description: "File or directory path to analyze" }),
@@ -488,259 +487,207 @@ Supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, Swift, Ruby, 
     },
   });
 
-  // Instruct the LLM to prefer code_nav over grep for structural navigation
+  // ── string_search tool (rg wrapper) ─────────────────────────────────────
+
+  const StringSearchParams = Type.Object({
+    pattern: Type.String({ description: "Regex pattern to search for (Rust regex syntax)" }),
+    path: Type.String({ description: "File or directory to search in" }),
+    fixedStrings: Type.Optional(
+      Type.Boolean({ description: "Treat pattern as a literal string, not a regex (default: false)" }),
+    ),
+    caseSensitive: Type.Optional(
+      Type.Boolean({ description: "Force case-sensitive search (default: smart-case — case-insensitive unless pattern has uppercase)" }),
+    ),
+    include: Type.Optional(
+      Type.Array(Type.String(), { description: 'Glob patterns to include, e.g. ["*.go", "*.ts"]' }),
+    ),
+    exclude: Type.Optional(
+      Type.Array(Type.String(), { description: 'Glob patterns to exclude, e.g. ["*_test.go", "vendor/**"]' }),
+    ),
+    context: Type.Optional(
+      Type.Number({ description: "Lines of context to show around each match (default: 0)" }),
+    ),
+    maxResults: Type.Optional(
+      Type.Number({ description: "Maximum number of matching lines to return (default: 500)" }),
+    ),
+  });
+
+  pi.registerTool({
+    name: "string_search",
+    label: "String Search",
+    description: `Search for text patterns in files using ripgrep. Returns matching lines with file paths and line numbers. Searches recursively by default, respects .gitignore, and skips binary files.
+
+Use this for literal text searches: config values, error messages, TODOs, log strings, identifiers in non-code files, etc.
+For code structure (finding functions, classes, types, etc.), use \`code_nav\` instead.
+For finding all occurrences of an identifier in code, use \`find_identifiers\` instead.
+
+Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.`,
+    parameters: StringSearchParams,
+
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const rawPath = params.path.replace(/^@/, "");
+      const absPath = resolve(ctx.cwd, rawPath);
+
+      const args: string[] = [
+        "--line-number",
+        "--no-heading",
+        "--color", "never",
+      ];
+
+      if (params.fixedStrings) args.push("--fixed-strings");
+      if (params.caseSensitive) args.push("--case-sensitive");
+      if (params.context && params.context > 0) args.push("-C", String(params.context));
+
+      const maxResults = params.maxResults ?? 500;
+      args.push("--max-count", String(maxResults));
+
+      if (params.include) {
+        for (const glob of params.include) {
+          args.push("--glob", glob);
+        }
+      }
+      if (params.exclude) {
+        for (const glob of params.exclude) {
+          args.push("--glob", `!${glob}`);
+        }
+      }
+
+      args.push("--", params.pattern, absPath);
+
+      return new Promise((resolvePromise) => {
+        const child = execFile("rg", args, {
+          maxBuffer: 10 * 1024 * 1024,
+          cwd: ctx.cwd,
+          signal: signal ?? undefined,
+        }, (err, stdout, stderr) => {
+          // rg exits 1 for "no matches" — not an error
+          if (err && (err as any).code !== 1 && !signal?.aborted) {
+            resolvePromise({
+              content: [{ type: "text", text: stderr || err.message }],
+              isError: true,
+              details: {},
+            });
+            return;
+          }
+
+          if (!stdout.trim()) {
+            resolvePromise({
+              content: [{ type: "text", text: `No matches for "${params.pattern}" in ${rawPath}` }],
+              details: { pattern: params.pattern, path: rawPath, matchCount: 0 },
+            });
+            return;
+          }
+
+          // Make paths relative to cwd
+          let output = stdout;
+          const cwdPrefix = ctx.cwd.endsWith(sep) ? ctx.cwd : ctx.cwd + sep;
+          if (output.includes(cwdPrefix)) {
+            output = output.split(cwdPrefix).join("");
+          }
+
+          const matchCount = output.split("\n").filter((l) => l.trim() && !l.startsWith("--")).length;
+
+          const truncation = truncateHead(output, {
+            maxLines: DEFAULT_MAX_LINES,
+            maxBytes: DEFAULT_MAX_BYTES,
+          });
+
+          let resultText = truncation.content;
+          if (truncation.truncated) {
+            resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines]`;
+          }
+
+          resolvePromise({
+            content: [{ type: "text", text: resultText }],
+            details: {
+              pattern: params.pattern,
+              path: rawPath,
+              matchCount,
+              truncated: truncation.truncated,
+            },
+          });
+        });
+      });
+    },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("string_search "));
+      text += theme.fg("accent", `"${args.pattern}"`);
+      text += " " + theme.fg("muted", args.path);
+      if (args.include) text += theme.fg("dim", ` include=${args.include.join(",")}`);
+      if (args.exclude) text += theme.fg("dim", ` exclude=${args.exclude.join(",")}`);
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, { expanded }, theme) {
+      const details = result.details as { matchCount?: number; truncated?: boolean } | undefined;
+
+      if (result.isError) {
+        const errText = result.content[0];
+        return new Text(theme.fg("error", errText?.type === "text" ? errText.text : "Error"), 0, 0);
+      }
+
+      if (!details || details.matchCount === 0) {
+        return new Text(theme.fg("dim", "No matches"), 0, 0);
+      }
+
+      let text = theme.fg("success", `${details.matchCount} matches`);
+      if (details.truncated) {
+        text += " " + theme.fg("warning", "(truncated)");
+      }
+
+      if (expanded) {
+        const content = result.content[0];
+        if (content?.type === "text") {
+          const lines = content.text.split("\n").slice(0, 30);
+          for (const line of lines) {
+            text += "\n" + theme.fg("dim", line);
+          }
+          const totalLines = content.text.split("\n").length;
+          if (totalLines > 30) {
+            text += `\n${theme.fg("muted", `... ${totalLines - 30} more lines`)}`;
+          }
+        }
+      }
+
+      return new Text(text, 0, 0);
+    },
+  });
+
+  // ── System prompt & grep/rg blocking ───────────────────────────────────
+
   pi.on("before_agent_start", async (event) => {
-    const instruction = `\n\n**IMPORTANT: ALWAYS use \`code_nav\` as the FIRST tool for exploring code structure** (finding symbols, types, interfaces, functions, classes, enums, methods, etc.). For single files, \`code_nav\` shows all nested symbols. For directories, it shows top-level symbols — if you need inner/nested symbols, call \`code_nav\` on the specific file. Use \`find_identifiers\` to find all occurrences of a name across files (like find-references but not scope-aware — skips strings and comments, exact identifier match only). Structural grep/rg searches on code files (patterns containing keywords like function, class, def, struct, impl, trait, type, interface, enum, etc.) are BLOCKED and will fail. Use \`code_nav\` for structure, \`find_identifiers\` for usage search, \`read\` for file contents, and \`grep\`/\`rg\` only for literal text searches (config values, error strings, TODOs, etc.).`;
+    const instruction = `\n\n**IMPORTANT: ALWAYS use \`code_nav\` as the FIRST tool for exploring code structure** (finding symbols, types, interfaces, functions, classes, enums, methods, etc.). For single files, \`code_nav\` shows all nested symbols. For directories, it shows top-level symbols — if you need inner/nested symbols, call \`code_nav\` on the specific file. Use \`find_identifiers\` to find all occurrences of a name across files (like find-references but not scope-aware — skips strings and comments, exact identifier match only). \`grep\` and \`rg\` are NOT available in bash — use the \`string_search\` tool for text/pattern searches (config values, error strings, TODOs, etc.). Use \`code_nav\` for structure, \`find_identifiers\` for usage search, \`string_search\` for text pattern searches, and \`read\` for file contents.`;
     return {
       systemPrompt: event.systemPrompt + instruction,
     };
   });
 
-  // Intercept bash calls that use grep/rg for structural code navigation
-  // on file types we support, and block them with a suggestion to use code_nav.
+  // Unconditionally block grep/rg in bash — use string_search tool instead
   pi.on("tool_call", async (event) => {
     if (!isToolCallEventType("bash", event)) return;
 
     const cmd = event.input.command;
     if (!cmd) return;
 
-    const parsed = parseGrepCommand(cmd);
-    if (!parsed) return;
-
-    const supportedExts = new Set(getSupportedExtensions());
-    const rgTypeMap = getRgTypeMap();
-
-    // Collect targeted file extensions from flags and file arguments
-    const targetedExts: string[] = [];
-
-    // From explicit file path arguments
-    for (const filePath of parsed.files) {
-      const ext = extname(filePath).toLowerCase();
-      if (ext && supportedExts.has(ext)) {
-        targetedExts.push(ext);
-      }
+    // Quick check: does the command contain grep or rg?
+    if (!/(^|\||\;|\&|\()\s*(grep|rg|ripgrep)\b/.test(cmd) &&
+        !/\b(grep|rg|ripgrep)\s/.test(cmd)) {
+      return;
     }
 
-    // From --include=*.ext (grep)
-    for (const pattern of parsed.includeGlobs) {
-      const m = pattern.match(/\*?(\.\w+)$/);
-      if (m && supportedExts.has(m[1].toLowerCase())) {
-        targetedExts.push(m[1].toLowerCase());
-      }
-    }
-
-    // From --type/-t (rg)
-    for (const typeName of parsed.typeFilters) {
-      const mapped = rgTypeMap[typeName.toLowerCase()];
-      if (mapped && supportedExts.has(mapped)) {
-        targetedExts.push(mapped);
-      }
-    }
-
-    // Check if the search pattern contains structural code keywords
-    const structuralPatterns = [
-      /\b(def|function|func|fn|class|interface|type|struct|enum|trait|impl|module|mod|export|import|pub|private|protected|abstract)\b/,
-      /\b(class|interface|type|struct|enum|trait)\s+\w/,
-      /\b(def|function|func|fn)\s+\w/,
-    ];
-
-    const isStructuralSearch = structuralPatterns.some((p) => p.test(parsed.pattern));
-
-    // Block if targeting supported files AND the pattern is structural,
-    // OR if it's a recursive search with structural patterns
-    const shouldBlock =
-      (targetedExts.length > 0 && isStructuralSearch) ||
-      (parsed.isRecursive && isStructuralSearch);
-
-    if (shouldBlock) {
-      return {
-        block: true,
-        reason:
-          `BLOCKED: Do NOT use \`${parsed.tool}\` on code files. You MUST use \`code_nav\` instead. ` +
-          `This is not a suggestion — grep/rg on code files is disabled. ` +
-          `Use code_nav with action="outline" to explore structure, action="symbols" with kind= to filter, ` +
-          `or \`read\` to examine specific files. ` +
-          `grep/rg is ONLY for non-code files (logs, .txt, .csv, .env, etc.) or piped output.`,
-      };
-    }
+    return {
+      block: true,
+      reason:
+        `BLOCKED: grep/rg are not available in bash. Use the \`string_search\` tool for text pattern searches, ` +
+        `\`code_nav\` for code structure, or \`find_identifiers\` for identifier usage.`,
+    };
   });
 
   // Clean up on shutdown
   pi.on("session_shutdown", async () => {
     clearCache();
   });
-}
-
-// ─── Grep/rg command parsing ─────────────────────────────────────────────
-
-/** Flags that consume the next argument as a value (not a file path). */
-const GREP_VALUE_FLAGS = new Set([
-  // grep
-  "-e", "-f", "-m", "--max-count", "-A", "--after-context",
-  "-B", "--before-context", "-C", "--context", "--label",
-  "--color", "--colour", "--include", "--exclude", "--exclude-dir",
-  // rg
-  "-t", "--type", "-T", "--type-not", "-g", "--glob", "--iglob",
-  "-j", "--threads", "-M", "--max-columns", "--max-filesize",
-  "--max-depth", "--maxdepth", "-E", "--encoding",
-  "--sort", "--sortr", "--type-add", "--type-clear",
-  "--colors", "--context-separator", "--field-match-separator",
-  "--path-separator", "-r", "--replace", "--pre", "--pre-glob",
-  "--after-context", "--before-context",
-]);
-
-interface ParsedGrepCommand {
-  tool: "grep" | "rg" | "ripgrep";
-  pattern: string;
-  files: string[];
-  flags: string[];
-  includeGlobs: string[];
-  typeFilters: string[];
-  isRecursive: boolean;
-}
-
-/**
- * Parse a shell command string to extract grep/rg invocation details.
- * Returns null if the command doesn't contain a grep/rg call.
- *
- * For pipelines and compound commands, checks each sub-command.
- */
-function parseGrepCommand(cmd: string): ParsedGrepCommand | null {
-  const tokens = parseShell(cmd);
-
-  // Flatten tokens — shell-quote returns strings, operators ({op: '|'}),
-  // and globs ({op: 'glob', pattern: '...'}) for unquoted wildcards.
-  const args: string[] = [];
-  for (const token of tokens) {
-    if (typeof token === "string") {
-      args.push(token);
-    } else if (typeof token === "object" && token !== null) {
-      if ("pattern" in token) {
-        // Glob token (e.g. --include=*.py unquoted) — treat as a string arg
-        args.push(String(token.pattern));
-      } else if ("op" in token) {
-        // Pipe, semicolon, &&, || — treat as command boundary
-        const result = tryParseGrepArgs(args);
-        if (result) return result;
-        args.length = 0;
-      }
-    }
-  }
-
-  // Check the last (or only) segment
-  return tryParseGrepArgs(args);
-}
-
-/** Try to parse an argument list as a grep/rg invocation. */
-function tryParseGrepArgs(args: string[]): ParsedGrepCommand | null {
-  // Find the grep/rg binary — could be a path like /usr/bin/grep
-  const toolIdx = args.findIndex((a) => /^(.*\/)?(grep|rg|ripgrep)$/.test(a));
-  if (toolIdx === -1) return null;
-
-  const toolBin = args[toolIdx];
-  const tool = toolBin.endsWith("grep") ? "grep" as const
-    : toolBin.endsWith("ripgrep") ? "ripgrep" as const
-    : "rg" as const;
-
-  const rest = args.slice(toolIdx + 1);
-
-  const flags: string[] = [];
-  const files: string[] = [];
-  const includeGlobs: string[] = [];
-  const typeFilters: string[] = [];
-  const explicitPatterns: string[] = [];
-  let isRecursive = tool === "rg"; // rg is recursive by default
-  let patternConsumed = false;
-
-  let i = 0;
-  while (i < rest.length) {
-    const arg = rest[i];
-
-    if (arg === "--") {
-      // Everything after -- is file paths
-      files.push(...rest.slice(i + 1));
-      break;
-    }
-
-    if (arg.startsWith("-")) {
-      flags.push(arg);
-
-      // Check for recursive flags
-      if (arg === "-r" || arg === "-R" || arg === "--recursive") {
-        isRecursive = true;
-      }
-      // Short flags can be combined: -rn, -rin, etc.
-      if (/^-[a-zA-Z]*[rR][a-zA-Z]*$/.test(arg) && !arg.startsWith("--")) {
-        isRecursive = true;
-      }
-
-      // Handle --flag=value style
-      const eqIdx = arg.indexOf("=");
-      if (eqIdx !== -1) {
-        const flagName = arg.slice(0, eqIdx);
-        const flagValue = arg.slice(eqIdx + 1);
-
-        if (flagName === "--include") {
-          includeGlobs.push(flagValue);
-        } else if (flagName === "--type" || flagName === "-t") {
-          typeFilters.push(flagValue);
-        } else if (flagName === "-e" || flagName === "--regexp") {
-          explicitPatterns.push(flagValue);
-        }
-        i++;
-        continue;
-      }
-
-      // Handle -e / --regexp (explicit pattern, can appear multiple times)
-      if (arg === "-e" || arg === "--regexp") {
-        if (i + 1 < rest.length) {
-          explicitPatterns.push(rest[i + 1]);
-          i += 2;
-          continue;
-        }
-      }
-
-      // Handle --include (grep)
-      if (arg === "--include") {
-        if (i + 1 < rest.length) {
-          includeGlobs.push(rest[i + 1]);
-          i += 2;
-          continue;
-        }
-      }
-
-      // Handle --type / -t (rg)
-      if (arg === "--type" || arg === "-t") {
-        if (i + 1 < rest.length) {
-          typeFilters.push(rest[i + 1]);
-          i += 2;
-          continue;
-        }
-      }
-
-      // Check if this flag consumes the next arg as a value
-      if (GREP_VALUE_FLAGS.has(arg)) {
-        i += 2; // skip flag + its value
-        continue;
-      }
-
-      i++;
-      continue;
-    }
-
-    // Positional argument: first one is the pattern, rest are files
-    if (!patternConsumed && explicitPatterns.length === 0) {
-      patternConsumed = true;
-      explicitPatterns.push(arg);
-    } else {
-      files.push(arg);
-    }
-    i++;
-  }
-
-  const pattern = explicitPatterns.join(" ");
-
-  return { tool, pattern, files, flags, includeGlobs, typeFilters, isRecursive };
 }
 
 // ─── Directory scanning ─────────────────────────────────────────────────

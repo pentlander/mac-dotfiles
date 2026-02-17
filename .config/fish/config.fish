@@ -10,6 +10,7 @@ if status is-interactive
     fish_add_path -g "$HOME/bin"
     fish_add_path -g "$HOME/.local/bin"
     fish_add_path -g "$HOME/go/bin"
+    fish_add_path -g "$HOME/.raildev"
 
 
     set -gx EDITOR nvim
