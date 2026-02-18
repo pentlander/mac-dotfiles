@@ -53,6 +53,7 @@ if status is-interactive
     abbr -a jds 'jj describe -m'
     abbr -a je 'jj edit'
     abbr -a jl 'jj log'
+    abbr -a jlg 'jj log --stat --limit 10'
     abbr -a jlt 'jj log -r "trunk()..@"'
     abbr -a js 'jj squash'
     abbr -a jsi 'jj split'

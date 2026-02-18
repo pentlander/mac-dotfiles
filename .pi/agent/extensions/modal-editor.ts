@@ -21,7 +21,12 @@
  *   x       — delete character under cursor
  *   C       — delete to end of line, enter insert mode
  *   cc      — clear line, enter insert mode
+ *   cw/ce   — delete word forward, enter insert mode
+ *   cb      — delete word backward, enter insert mode
  *   dd      — delete current line
+ *   dw/de   — delete word forward
+ *   db      — delete word backward
+ *   u       — undo
  *   v       — open prompt in $EDITOR (nvim)
  *   Escape  — pass through to app (abort agent, etc.)
  *
@@ -90,6 +95,21 @@ class ModalEditor extends CustomEditor {
         this.deleteCurrentLine();
         return;
       }
+      if (data === "w") {
+        // dw: delete word forward (includes trailing whitespace)
+        this.deleteWordForward(true);
+        return;
+      }
+      if (data === "e") {
+        // de: delete to end of word
+        this.deleteWordForward(false);
+        return;
+      }
+      if (data === "b") {
+        // db: delete word backward
+        this.deleteWordBackward();
+        return;
+      }
       return;
     }
     if (this.pendingKey === "c") {
@@ -98,6 +118,18 @@ class ModalEditor extends CustomEditor {
         // cc: clear line contents, stay on the line in insert mode
         super.handleInput(ESC.home);
         super.handleInput(ESC.deleteToEnd);
+        this.mode = "insert";
+        return;
+      }
+      if (data === "w" || data === "e") {
+        // cw/ce: delete to end of word, enter insert mode
+        this.deleteWordForward(false);
+        this.mode = "insert";
+        return;
+      }
+      if (data === "b") {
+        // cb: delete word backward, enter insert mode
+        this.deleteWordBackward();
         this.mode = "insert";
         return;
       }
@@ -182,6 +214,11 @@ class ModalEditor extends CustomEditor {
         this.mode = "insert";
         return;
 
+      // Undo
+      case "u":
+        super.handleInput("\x1f"); // ctrl+- = undo
+        return;
+
       // External editor
       case "v":
         this.openInExternalEditor();
@@ -192,6 +229,63 @@ class ModalEditor extends CustomEditor {
         if (data.length === 1 && data.charCodeAt(0) >= 32) return;
         super.handleInput(data);
         return;
+    }
+  }
+
+  private deleteWordForward(includeTrailingSpace: boolean): void {
+    const lines = this.getLines();
+    const { line, col } = this.getCursor();
+    const text = lines[line] || "";
+
+    if (col >= text.length) return;
+
+    let end = col;
+    if (/\s/.test(text[end]!)) {
+      // On whitespace: skip whitespace, then skip word
+      while (end < text.length && /\s/.test(text[end]!)) end++;
+      while (end < text.length && !/\s/.test(text[end]!)) end++;
+    } else {
+      // In a word: skip to end of word
+      while (end < text.length && !/\s/.test(text[end]!)) end++;
+      // dw also consumes trailing whitespace
+      if (includeTrailingSpace) {
+        while (end < text.length && /\s/.test(text[end]!)) end++;
+      }
+    }
+
+    lines[line] = text.slice(0, col) + text.slice(end);
+    this.setText(lines.join("\n"));
+    this.moveCursorTo(line, col, lines.length);
+  }
+
+  private deleteWordBackward(): void {
+    const lines = this.getLines();
+    const { line, col } = this.getCursor();
+    const text = lines[line] || "";
+
+    if (col <= 0) return;
+
+    let start = col;
+    // Skip whitespace backwards
+    while (start > 0 && /\s/.test(text[start - 1]!)) start--;
+    // Skip word characters backwards
+    while (start > 0 && !/\s/.test(text[start - 1]!)) start--;
+
+    lines[line] = text.slice(0, start) + text.slice(col);
+    this.setText(lines.join("\n"));
+    this.moveCursorTo(line, start, lines.length);
+  }
+
+  /** Reposition cursor after setText (which places cursor at end of last line) */
+  private moveCursorTo(targetLine: number, targetCol: number, totalLines: number): void {
+    const lastLine = totalLines - 1;
+    // After setText, cursor is at (lastLine, endOfLastLine)
+    super.handleInput(ESC.home); // go to col 0
+    for (let i = 0; i < lastLine - targetLine; i++) {
+      super.handleInput(ESC.up);
+    }
+    for (let i = 0; i < targetCol; i++) {
+      super.handleInput(ESC.right);
     }
   }
 
@@ -210,10 +304,7 @@ class ModalEditor extends CustomEditor {
 
     // Restore cursor to same line (or last line if we deleted the last one)
     const targetLine = Math.min(cursor.line, lines.length - 1);
-    // setText puts cursor at 0,0 — move to target line
-    for (let i = 0; i < targetLine; i++) {
-      super.handleInput(ESC.down);
-    }
+    this.moveCursorTo(targetLine, 0, lines.length);
   }
 
   private openInExternalEditor(): void {
