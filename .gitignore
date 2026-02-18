@@ -3,3 +3,4 @@
 .pi/agent/auth.json
 .pi/agent/bin/
 .pi/agent/extensions/*/node_modules/
+.code-search-cache/

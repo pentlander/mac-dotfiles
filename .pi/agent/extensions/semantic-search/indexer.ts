@@ -22,6 +22,7 @@ const SKIP_DIRS = new Set([
   "build",
   "dist",
   ".git",
+  ".jj",
   ".code-search-cache",
   ".next",
   ".nuxt",
@@ -309,7 +310,7 @@ function collectFiles(
       const relPath = relative(rootDir, fullPath);
 
       if (entry.isDirectory()) {
-        if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
+        if (SKIP_DIRS.has(entry.name)) continue;
         if (ig.ignores(relPath + "/")) continue;
         walk(fullPath);
       } else if (entry.isFile()) {
