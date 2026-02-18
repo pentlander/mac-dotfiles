@@ -20,6 +20,7 @@ if status is-interactive
     bind --mode insert \cn 'accept-autosuggestion'
 
     alias vim='nvim'
+    alias pi='/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js'
     alias gwip='git add -A; git ls-files --deleted -z | xargs -0 git rm; git commit --no-verify -m "--wip--"'
     alias gunwip='git log -n 1 | grep -q -c "\-\-wip\-\-" && git reset HEAD~1'
     alias gme='git log --author $(git config --get user.name)'
