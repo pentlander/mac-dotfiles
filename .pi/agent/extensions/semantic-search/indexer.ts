@@ -135,6 +135,8 @@ export async function indexDirectory(
     chunks: ChunkInfo[]; relPath: string; fileHash: string; language: string;
   }> = [];
 
+  const parseFailures: Array<{ relPath: string; fileHash: string }> = [];
+
   for (const { absPath, relPath, fileHash } of toIndex) {
     if (signal?.aborted) break;
     try {
@@ -142,8 +144,22 @@ export async function indexDirectory(
       const lang = chunks.length > 0 ? chunks[0].language : "unknown";
       allFileChunks.push({ chunks, relPath, fileHash, language: lang });
     } catch {
+      // Store failed files in DB with 0 symbols so we skip them next time
+      parseFailures.push({ relPath, fileHash });
       stats.filesSkipped++;
     }
+  }
+
+  // Record parse failures so incremental re-index skips them
+  if (parseFailures.length > 0) {
+    backend.upsertFiles(
+      parseFailures.map((f) => ({
+        path: f.relPath,
+        hash: f.fileHash,
+        language: null,
+        symbolCount: 0,
+      })),
+    );
   }
 
   if (signal?.aborted) return stats;
