@@ -1,22 +1,16 @@
 {
   "name": "pi-extension-semantic-search",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "pi": {
     "extensions": ["./index.ts"]
   },
   "scripts": {
-    "rebuild": "npm rebuild better-sqlite3 onnxruntime-node"
+    "build-native": "cd native && cargo build --release && cp target/release/libsemantic_search_native.dylib semantic-search-native.node"
   },
   "dependencies": {
-    "onnxruntime-node": "^1.24.1",
-    "better-sqlite3": "^11.0.0",
-    "sqlite-vec": "^0.1.7-alpha.2",
     "xxhash-wasm": "^1.0.0",
     "ignore": "^6.0.0"
-  },
-  "devDependencies": {
-    "@types/better-sqlite3": "^7.6.0"
   }
 }

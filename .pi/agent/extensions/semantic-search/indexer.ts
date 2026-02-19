@@ -3,51 +3,26 @@
  *
  * Walks a directory tree, hashes files with xxhash, compares against
  * the database, and only re-embeds changed files.
+ *
+ * Uses the native Rust backend — embed+store is a single FFI call.
  */
 
-import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
-import { resolve, extname, relative, join } from "node:path";
+import { readdirSync, readFileSync, existsSync } from "node:fs";
+import { resolve, relative, join } from "node:path";
 import xxhashInit from "xxhash-wasm";
 import ignore from "ignore";
-import { SearchDB } from "./db.js";
-import { Embedder } from "./embedder.js";
+import type { NativeBackend } from "./native-backend.js";
 import { extractChunks, isSupportedFile, type ChunkInfo } from "./chunker.js";
 
-/** Directories to always skip. */
 const SKIP_DIRS = new Set([
-  "node_modules",
-  "vendor",
-  "__pycache__",
-  "target",
-  "build",
-  "dist",
-  ".git",
-  ".jj",
-  ".code-search-cache",
-  ".next",
-  ".nuxt",
+  "node_modules", "vendor", "__pycache__", "target", "build", "dist",
+  ".git", ".jj", ".code-search-cache", ".next", ".nuxt",
 ]);
 
-/** File patterns to skip (generated code, etc.) */
 const SKIP_PATTERNS = [
-  /\.pb\.go$/,
-  /\.pb\.gw\.go$/,
-  /_generated\.go$/,
-  /\.gen\.go$/,
-  /\.d\.ts$/,
-  /\.min\.js$/,
-  /\.bundle\.js$/,
+  /\.pb\.go$/, /\.pb\.gw\.go$/, /_generated\.go$/, /\.gen\.go$/,
+  /\.d\.ts$/, /\.min\.js$/, /\.bundle\.js$/,
 ];
-
-/** Config file extensions — only index top-level blocks, not leaf keys */
-const CONFIG_EXTENSIONS = new Set([
-  ".toml",
-  ".yaml",
-  ".yml",
-  ".hcl",
-  ".tf",
-  ".tfvars",
-]);
 
 export interface IndexStats {
   filesScanned: number;
@@ -62,28 +37,17 @@ export interface IndexStats {
 let xxhash: Awaited<ReturnType<typeof xxhashInit>> | null = null;
 
 async function getXxhash() {
-  if (!xxhash) {
-    xxhash = await xxhashInit();
-  }
+  if (!xxhash) xxhash = await xxhashInit();
   return xxhash;
 }
 
 /**
  * Incrementally index a directory scope.
- *
- * @param scanDir  Absolute path to the directory to scan for files
- * @param repoRoot Absolute path to the repo root (paths stored relative to this)
- * @param db       SearchDB instance (DB lives at repoRoot/.code-search-cache/)
- * @param embedder Initialized Embedder instance
- * @param signal   AbortSignal for cancellation
- * @param onProgress Progress callback
- * @returns Index statistics
  */
 export async function indexDirectory(
   scanDir: string,
   repoRoot: string,
-  db: SearchDB,
-  embedder: Embedder,
+  backend: NativeBackend,
   signal?: AbortSignal,
   onProgress?: (msg: string) => void,
 ): Promise<IndexStats> {
@@ -91,82 +55,63 @@ export async function indexDirectory(
   const hash = await getXxhash();
 
   const stats: IndexStats = {
-    filesScanned: 0,
-    filesIndexed: 0,
-    filesSkipped: 0,
-    filesDeleted: 0,
-    symbolsIndexed: 0,
-    indexTimeMs: 0,
-    embedTimeMs: 0,
+    filesScanned: 0, filesIndexed: 0, filesSkipped: 0,
+    filesDeleted: 0, symbolsIndexed: 0, indexTimeMs: 0, embedTimeMs: 0,
   };
 
-  // Load .gitignore files from repoRoot down to scanDir
+  // Load .gitignore chain
   const ignoreFactory = typeof ignore === "function" ? ignore : ignore.default;
   const ig = ignoreFactory();
 
   const rootGitignore = join(repoRoot, ".gitignore");
-  if (existsSync(rootGitignore)) {
-    ig.add(readFileSync(rootGitignore, "utf-8"));
-  }
+  if (existsSync(rootGitignore)) ig.add(readFileSync(rootGitignore, "utf-8"));
   if (scanDir !== repoRoot) {
     const rel = relative(repoRoot, scanDir);
-    const parts = rel.split("/");
     let cur = repoRoot;
-    for (const part of parts) {
+    for (const part of rel.split("/")) {
       cur = join(cur, part);
       const gi = join(cur, ".gitignore");
-      if (cur !== repoRoot && existsSync(gi)) {
-        ig.add(readFileSync(gi, "utf-8"));
-      }
+      if (cur !== repoRoot && existsSync(gi)) ig.add(readFileSync(gi, "utf-8"));
     }
   }
 
-  // Collect all supported files under scanDir, paths relative to repoRoot
+  // Collect files
   onProgress?.("Scanning files...");
   const files = collectFiles(scanDir, ig, repoRoot);
   stats.filesScanned = files.length;
-
   if (signal?.aborted) return stats;
 
-  // Scope prefix for filtering existing DB entries
-  const scopePrefix = scanDir === repoRoot
-    ? null
-    : relative(repoRoot, scanDir);
+  // Scope prefix
+  const scopePrefix = scanDir === repoRoot ? null : relative(repoRoot, scanDir);
 
-  // Get existing indexed files — only those within our scan scope
+  // Get existing indexed files within scope
   const existingFiles = new Map<string, string>();
-  for (const f of db.getAllFiles()) {
+  for (const f of backend.getAllFiles()) {
     if (scopePrefix === null || f.path.startsWith(scopePrefix + "/")) {
       existingFiles.set(f.path, f.hash);
     }
   }
 
-  // Determine what needs updating
+  // Diff: what changed, what's new
   const toIndex: Array<{ absPath: string; relPath: string; fileHash: string }> = [];
   const seen = new Set<string>();
 
   for (const absPath of files) {
     const relPath = relative(repoRoot, absPath);
     seen.add(relPath);
-
     const content = readFileSync(absPath, "utf-8");
     const fileHash = hash.h64ToString(content);
-
-    const existingHash = existingFiles.get(relPath);
-    if (existingHash === fileHash) {
+    if (existingFiles.get(relPath) === fileHash) {
       stats.filesSkipped++;
       continue;
     }
-
     toIndex.push({ absPath, relPath, fileHash });
   }
 
-  // Find deleted files (only within our scan scope)
+  // Deleted files
   const toDelete: string[] = [];
   for (const [path] of existingFiles) {
-    if (!seen.has(path)) {
-      toDelete.push(path);
-    }
+    if (!seen.has(path)) toDelete.push(path);
   }
 
   if (toIndex.length === 0 && toDelete.length === 0) {
@@ -179,130 +124,72 @@ export async function indexDirectory(
   if (toDelete.length > 0) parts.push(`${toDelete.length} deleted`);
   onProgress?.(`Updating index: ${parts.join(", ")}...`);
 
-  // Process in a transaction
-  db.transaction(() => {
-    // Delete removed files
-    for (const path of toDelete) {
-      db.deleteFileAndSymbols(path);
-      stats.filesDeleted++;
-    }
-  });
+  // 1. Delete removed files (1 FFI call)
+  if (toDelete.length > 0) {
+    backend.deleteFiles(toDelete);
+    stats.filesDeleted = toDelete.length;
+  }
 
-  // Extract chunks from files that need indexing
-  const allChunks: Array<{ chunks: ChunkInfo[]; relPath: string; fileHash: string; language: string }> = [];
+  // 2. Extract chunks via tree-sitter (TypeScript)
+  const allFileChunks: Array<{
+    chunks: ChunkInfo[]; relPath: string; fileHash: string; language: string;
+  }> = [];
 
   for (const { absPath, relPath, fileHash } of toIndex) {
     if (signal?.aborted) break;
-
     try {
       const chunks = await extractChunks(absPath, repoRoot);
       const lang = chunks.length > 0 ? chunks[0].language : "unknown";
-      allChunks.push({ chunks, relPath, fileHash, language: lang });
+      allFileChunks.push({ chunks, relPath, fileHash, language: lang });
     } catch {
-      // Skip files that fail to parse
       stats.filesSkipped++;
     }
   }
 
   if (signal?.aborted) return stats;
 
-  // Collect all embedding texts
-  const allTexts: string[] = [];
-  const chunkMap: Array<{ batchIdx: number; chunk: ChunkInfo; relPath: string; fileHash: string; language: string }> = [];
+  const allChunks: ChunkInfo[] = allFileChunks.flatMap((f) => f.chunks);
 
-  for (const { chunks, relPath, fileHash, language } of allChunks) {
-    for (const chunk of chunks) {
-      chunkMap.push({ batchIdx: allTexts.length, chunk, relPath, fileHash, language });
-      allTexts.push(chunk.embeddingText);
-    }
+  // 3. Delete old symbols for changed files (1 FFI call)
+  backend.deleteFiles(allFileChunks.map((f) => f.relPath));
+
+  // 4. Embed + store all chunks (1 FFI call — the big one)
+  if (allChunks.length > 0) {
+    onProgress?.(`Embedding ${allChunks.length} symbols...`);
+    const embedStart = performance.now();
+    backend.indexSymbols(allChunks);
+    stats.embedTimeMs = Math.round(performance.now() - embedStart);
+    stats.symbolsIndexed = allChunks.length;
   }
 
-  if (allTexts.length === 0) {
-    // Files changed but produced no symbols (e.g. empty files)
-    db.transaction(() => {
-      for (const { relPath, fileHash, language } of allChunks) {
-        db.deleteFileAndSymbols(relPath);
-        db.upsertFile(relPath, fileHash, language, 0);
-      }
-    });
-    stats.filesIndexed = allChunks.length;
-    stats.indexTimeMs = Math.round(performance.now() - start);
-    return stats;
+  if (signal?.aborted) return stats;
+
+  // 5. Update file records (1 FFI call)
+  const fileSymbolCounts = new Map<string, number>();
+  for (const c of allChunks) {
+    fileSymbolCounts.set(c.filePath, (fileSymbolCounts.get(c.filePath) ?? 0) + 1);
   }
 
-  // Embed all texts
-  const embedStart = performance.now();
-  onProgress?.(`Embedding ${allTexts.length} symbols...`);
-  const embeddings = await embedder.embed(allTexts, false, signal);
-  stats.embedTimeMs = Math.round(performance.now() - embedStart);
+  backend.upsertFiles(
+    allFileChunks.map((f) => ({
+      path: f.relPath,
+      hash: f.fileHash,
+      language: f.language,
+      symbolCount: fileSymbolCounts.get(f.relPath) ?? 0,
+    })),
+  );
 
-  if (signal?.aborted || embeddings.length < allTexts.length) return stats;
-
-  // Write to database
-  onProgress?.("Writing to index...");
-
-  db.transaction(() => {
-    // Delete old symbols for changed files
-    const deletedPaths = new Set<string>();
-    for (const { relPath } of allChunks) {
-      if (!deletedPaths.has(relPath)) {
-        db.deleteFileAndSymbols(relPath);
-        deletedPaths.add(relPath);
-      }
-    }
-
-    // Insert new symbols
-    for (const { batchIdx, chunk } of chunkMap) {
-      db.insertSymbol(
-        embeddings[batchIdx],
-        chunk.language,
-        chunk.kind,
-        chunk.filePath,
-        chunk.name,
-        chunk.line,
-        chunk.endLine,
-        chunk.signature,
-        chunk.embeddingText,
-      );
-      stats.symbolsIndexed++;
-    }
-
-    // Update file records
-    const fileSymbolCounts = new Map<string, number>();
-    for (const { chunk } of chunkMap) {
-      const count = fileSymbolCounts.get(chunk.filePath) ?? 0;
-      fileSymbolCounts.set(chunk.filePath, count + 1);
-    }
-
-    for (const { relPath, fileHash, language } of allChunks) {
-      const count = fileSymbolCounts.get(relPath) ?? 0;
-      db.upsertFile(relPath, fileHash, language, count);
-      stats.filesIndexed++;
-    }
-  });
-
+  stats.filesIndexed = allFileChunks.length;
   stats.indexTimeMs = Math.round(performance.now() - start);
   return stats;
 }
 
-/**
- * Collect all supported files in a directory, respecting .gitignore and skip patterns.
- */
-function collectFiles(
-  dir: string,
-  ig: any,
-  rootDir: string,
-): string[] {
+function collectFiles(dir: string, ig: any, rootDir: string): string[] {
   const found: string[] = [];
 
   function walk(d: string) {
     let entries: ReturnType<typeof readdirSync>;
-    try {
-      entries = readdirSync(d, { withFileTypes: true });
-    } catch {
-      return;
-    }
-
+    try { entries = readdirSync(d, { withFileTypes: true }); } catch { return; }
     entries.sort((a, b) => a.name.localeCompare(b.name));
 
     for (const entry of entries) {

@@ -1,53 +1,39 @@
 /**
  * Semantic Code Search Extension
  *
- * Provides a `semantic_search` tool for natural-language code search using
- * CodeRankEmbed embeddings + sqlite-vec for vector KNN.
- *
- * Usage:
- *   Place in ~/.pi/agent/extensions/semantic-search/
- *   Run `npm install` in this directory.
+ * Natural-language code search using CodeRankEmbed (MLX Metal GPU) + sqlite-vec.
+ * All embedding and vector search runs in a native Rust addon via napi-rs.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
-  formatSize,
   truncateHead,
 } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import { resolve, join, relative } from "node:path";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { execSync } from "node:child_process";
 
-import { SearchDB, type SearchResult } from "./db.js";
-import { Embedder } from "./embedder.js";
+import { NativeBackend } from "./native-backend.js";
 import { indexDirectory, type IndexStats } from "./indexer.js";
 
 const CACHE_DIR = ".code-search-cache";
 const DB_FILE = "index.db";
 
-/** Per-directory state: DB + warm status */
-const indexCache = new Map<string, { db: SearchDB; lastStats: IndexStats | null }>();
+let backend: NativeBackend | null = null;
+/** Set of repo roots we've already opened a DB for */
+const openedDbs = new Set<string>();
 
-/** Shared embedder (one model instance across all directories) */
-const embedder = new Embedder();
-let embedderReady = false;
-
-async function ensureEmbedder(onProgress?: (msg: string) => void): Promise<void> {
-  if (embedderReady) return;
-
-  if (!embedder.isModelDownloaded()) {
-    await embedder.downloadModel(onProgress);
+function ensureBackend(): NativeBackend {
+  if (!backend) {
+    backend = new NativeBackend();
   }
-
-  await embedder.init();
-  embedderReady = true;
+  return backend;
 }
 
-/** Find the git repo root for a directory, or return the directory itself. */
 function findRepoRoot(dir: string): string {
   try {
     return execSync("git rev-parse --show-toplevel", { cwd: dir, encoding: "utf-8" }).trim();
@@ -56,14 +42,13 @@ function findRepoRoot(dir: string): string {
   }
 }
 
-function getOrCreateDB(dir: string): SearchDB {
-  const cached = indexCache.get(dir);
-  if (cached) return cached.db;
-
-  const dbPath = join(dir, CACHE_DIR, DB_FILE);
-  const db = new SearchDB(dbPath);
-  indexCache.set(dir, { db, lastStats: null });
-  return db;
+function ensureDb(repoRoot: string): void {
+  const b = ensureBackend();
+  if (!openedDbs.has(repoRoot)) {
+    const dbPath = join(repoRoot, CACHE_DIR, DB_FILE);
+    b.openDb(dbPath);
+    openedDbs.add(repoRoot);
+  }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -72,20 +57,18 @@ export default function (pi: ExtensionAPI) {
   const SearchParams = Type.Object({
     query: Type.Union([
       Type.String({ description: "Natural language search query" }),
-      Type.Array(Type.String(), { description: "Multiple queries — results are merged and deduplicated, keeping the best score per symbol" }),
-    ], { description: "Search query or queries, e.g. 'rate limiting middleware' or ['rate limiting', 'request throttling']" }),
+      Type.Array(Type.String(), {
+        description: "Multiple queries — results are merged and deduplicated, keeping the best score per symbol",
+      }),
+    ], {
+      description: "Search query or queries, e.g. 'rate limiting middleware' or ['rate limiting', 'request throttling']",
+    }),
     path: Type.Optional(
       Type.String({ description: "Directory to search (default: current working directory)" }),
     ),
-    top_k: Type.Optional(
-      Type.Number({ description: "Number of results to return (default: 25)" }),
-    ),
-    threshold: Type.Optional(
-      Type.Number({ description: "Minimum similarity score 0-1 (default: 0.0)" }),
-    ),
-    language: Type.Optional(
-      Type.String({ description: 'Filter by language, e.g. "go", "typescript"' }),
-    ),
+    top_k: Type.Optional(Type.Number({ description: "Number of results to return (default: 25)" })),
+    threshold: Type.Optional(Type.Number({ description: "Minimum similarity score 0-1 (default: 0.0)" })),
+    language: Type.Optional(Type.String({ description: 'Filter by language, e.g. "go", "typescript"' })),
     kind: Type.Optional(
       Type.String({ description: 'Filter by symbol kind, e.g. "function", "struct", "interface"' }),
     ),
@@ -130,11 +113,8 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
         };
       }
 
-      // Always index at the repo root; use path as a post-filter prefix
       const repoRoot = findRepoRoot(targetDir);
-      const pathPrefix = repoRoot !== targetDir
-        ? relative(repoRoot, targetDir)
-        : null; // no filtering when searching from repo root
+      const pathPrefix = repoRoot !== targetDir ? relative(repoRoot, targetDir) : undefined;
 
       const searchStart = performance.now();
 
@@ -142,39 +122,36 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
         query: queryLabel, path: rawPath, resultCount: 0, searchTimeMs: 0, ...overrides,
       });
 
-      // Ensure model is ready
+      // Initialize native backend
+      let b: NativeBackend;
       try {
-        await ensureEmbedder((msg) => {
-          onUpdate?.({ content: [{ type: "text", text: msg }], details: mkDetails() });
-        });
+        b = ensureBackend();
+        ensureDb(repoRoot);
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Failed to load embedding model: ${message}` }],
-          isError: true, details: mkDetails({ isError: true }),
+          content: [{ type: "text", text: `Failed to initialize native backend: ${message}` }],
+          isError: true,
+          details: mkDetails({ isError: true }),
         };
       }
 
       if (signal?.aborted) {
         return { content: [{ type: "text", text: "Cancelled" }], details: mkDetails() };
       }
-
-      // Get or create index (always at repo root)
-      const db = getOrCreateDB(repoRoot);
 
       // Incremental index update
       let indexStats: IndexStats | undefined;
       try {
-        indexStats = await indexDirectory(targetDir, repoRoot, db, embedder, signal, (msg) => {
+        indexStats = await indexDirectory(targetDir, repoRoot, b, signal, (msg) => {
           onUpdate?.({ content: [{ type: "text", text: msg }], details: mkDetails() });
         });
-        const entry = indexCache.get(repoRoot);
-        if (entry) entry.lastStats = indexStats;
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Indexing failed: ${message}` }],
-          isError: true, details: mkDetails({ isError: true }),
+          isError: true,
+          details: mkDetails({ isError: true }),
         };
       }
 
@@ -182,37 +159,14 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
         return { content: [{ type: "text", text: "Cancelled" }], details: mkDetails() };
       }
 
-      // Embed queries and search — multi-query with dedup
+      // Search — single FFI call: batch embed queries + vector search + dedup
       try {
-        // Fetch more per-query so we have enough after dedup
-        const perQueryK = queries.length > 1 ? Math.ceil(topK * 1.5) : topK;
-
-        // Run all queries and merge results, keeping best score per symbol
-        const bestByKey = new Map<string, SearchResult>();
-
-        for (const q of queries) {
-          const qEmb = await embedder.embedQuery(q);
-          const results = db.search(qEmb, perQueryK, params.language, params.kind, pathPrefix ?? undefined);
-
-          for (const r of results) {
-            const key = `${r.file_path}:${r.line}:${r.name}`;
-            const existing = bestByKey.get(key);
-            if (!existing || r.score > existing.score) {
-              bestByKey.set(key, r);
-            }
-          }
-        }
-
-        // Sort by best score, filter by threshold, take top_k
-        const merged = [...bestByKey.values()]
-          .filter((r) => r.score >= threshold)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, topK);
+        const results = b.search(queries, topK, threshold, params.language, params.kind, pathPrefix);
 
         const searchTimeMs = Math.round(performance.now() - searchStart);
 
-        if (merged.length === 0) {
-          const stats = db.getStats();
+        if (results.length === 0) {
+          const stats = b.getStats();
           return {
             content: [{
               type: "text",
@@ -235,9 +189,8 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
         );
         lines.push(`${"Score".padEnd(7)} ${"File".padEnd(50)} Symbol`);
 
-        for (const r of merged) {
+        for (const r of results) {
           const lineRange = r.end_line ? `${r.line}-${r.end_line}` : String(r.line);
-          // file_path is relative to repo root; make it relative to cwd for display
           const absPath = join(repoRoot, r.file_path);
           const displayPath = relative(ctx.cwd, absPath);
           const fileStr = `${displayPath}:${lineRange}`;
@@ -256,13 +209,14 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
 
         return {
           content: [{ type: "text", text: resultText }],
-          details: mkDetails({ resultCount: merged.length, indexStats, searchTimeMs }),
+          details: mkDetails({ resultCount: results.length, indexStats, searchTimeMs }),
         };
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Search failed: ${message}` }],
-          isError: true, details: mkDetails({ isError: true }),
+          isError: true,
+          details: mkDetails({ isError: true }),
         };
       }
     },
@@ -290,8 +244,7 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
         const errText = result.content[0];
         return new Text(
           theme.fg("error", errText?.type === "text" ? errText.text : "Error"),
-          0,
-          0,
+          0, 0,
         );
       }
 
@@ -327,7 +280,7 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
   // ── /reindex command ──────────────────────────────────────────────────
 
   pi.registerCommand("reindex", {
-    description: "Force reindex of a directory (default: cwd). Deletes cached entries for the scope and re-indexes.",
+    description: "Force reindex of a directory (default: cwd).",
     handler: async (args, ctx) => {
       const rawPath = args?.trim() || ".";
       const scanDir = resolve(ctx.cwd, rawPath);
@@ -340,29 +293,25 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
 
       ctx.ui.notify(`Reindexing ${rawPath === "." ? "current directory" : rawPath}...`, "info");
 
+      let b: NativeBackend;
       try {
-        await ensureEmbedder((msg) => {
-          ctx.ui.notify(msg, "info");
-        });
+        b = ensureBackend();
+        ensureDb(repoRoot);
       } catch (err: unknown) {
-        ctx.ui.notify(`Failed to load model: ${err instanceof Error ? err.message : String(err)}`, "error");
+        ctx.ui.notify(`Failed to init: ${err instanceof Error ? err.message : String(err)}`, "error");
         return;
       }
 
-      // Delete symbols/files in the scope being reindexed
-      const db = getOrCreateDB(repoRoot);
+      // Delete symbols/files in scope
       const scopePrefix = scanDir === repoRoot ? null : relative(repoRoot, scanDir);
-      const allFiles = db.getAllFiles();
-      db.transaction(() => {
-        for (const f of allFiles) {
-          if (scopePrefix === null || f.path.startsWith(scopePrefix + "/")) {
-            db.deleteFileAndSymbols(f.path);
-          }
-        }
-      });
+      const allFiles = b.getAllFiles();
+      const toDelete = allFiles
+        .filter((f) => scopePrefix === null || f.path.startsWith(scopePrefix + "/"))
+        .map((f) => f.path);
+      b.deleteFiles(toDelete);
 
       // Rebuild
-      const stats = await indexDirectory(scanDir, repoRoot, db, embedder, undefined, (msg) => {
+      const stats = await indexDirectory(scanDir, repoRoot, b, undefined, (msg) => {
         ctx.ui.notify(msg, "info");
       });
 
@@ -373,7 +322,7 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
     },
   });
 
-  // ── System prompt injection ───────────────────────────────────────────
+  // ── System prompt ─────────────────────────────────────────────────────
 
   pi.on("before_agent_start", async (event) => {
     return {
@@ -384,20 +333,10 @@ First query on a new directory triggers indexing (~1-15s depending on repo size)
   // ── Cleanup ───────────────────────────────────────────────────────────
 
   pi.on("session_shutdown", async () => {
-    for (const [, entry] of indexCache) {
-      try {
-        entry.db.close();
-      } catch {
-        // ignore
-      }
+    if (backend) {
+      try { backend.dispose(); } catch { /* ignore */ }
+      backend = null;
     }
-    indexCache.clear();
-
-    try {
-      await embedder.dispose();
-    } catch {
-      // ignore
-    }
-    embedderReady = false;
+    openedDbs.clear();
   });
 }
