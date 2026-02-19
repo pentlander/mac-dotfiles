@@ -58,7 +58,7 @@ if status is-interactive
     abbr -a js 'jj squash'
     abbr -a jsi 'jj split'
     abbr -a jab 'jj absorb'
-    abbr -a jgf 'jj git fetch'
+    abbr -a jgf 'jj git fetch --branch master'
     abbr -a jgp 'jj git push'
     abbr -a jrb 'jj rebase'
     abbr -a ju 'jj undo'
