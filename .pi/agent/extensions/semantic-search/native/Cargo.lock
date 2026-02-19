@@ -79,6 +79,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "bytemuck"
+version = "1.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -968,6 +974,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "semantic-search-native"
 version = "0.0.0"
 dependencies = [
+ "bytemuck",
  "mlx-macros",
  "mlx-rs",
  "napi",
@@ -976,9 +983,8 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sqlite-vec",
+ "simsimd",
  "tokenizers",
- "zerocopy",
 ]
 
 [[package]]
@@ -1037,6 +1043,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "simsimd"
+version = "6.5.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f81af684ca3dc160907f1478d779bdfd8bae52f55f4c58caba0229670a83a0d"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1052,15 +1067,6 @@ dependencies = [
  "nom",
  "serde",
  "unicode-segmentation",
-]
-
-[[package]]
-name = "sqlite-vec"
-version = "0.1.7-alpha.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9dad2e5788b411800d8e15d55ee2c672ba0c0c87076713a1e6e2c9b83372a92"
-dependencies = [
- "cc",
 ]
 
 [[package]]

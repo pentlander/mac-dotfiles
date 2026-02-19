@@ -6,7 +6,7 @@
 use mlx_rs::{
     builder::Builder,
     error::Exception,
-    module::{Module, ModuleParameters, Param},
+    module::Module,
     nn::{self, Embedding, LayerNorm, Linear, Rope, RopeInput},
     ops,
     Array,

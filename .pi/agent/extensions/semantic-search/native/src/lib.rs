@@ -1,6 +1,6 @@
 //! Native addon for semantic code search.
 //!
-//! Provides MLX GPU embedding (CodeRankEmbed) and SQLite+sqlite-vec storage/search.
+//! Provides MLX GPU embedding (CodeRankEmbed) and SQLite + simsimd NEON vector search.
 //! Called from the TypeScript pi extension via napi-rs.
 //!
 //! Designed for minimal FFI overhead: batch APIs everywhere, embeddings never cross the boundary.
@@ -308,22 +308,22 @@ pub fn index_symbols(symbols: Vec<SymbolInput>) -> napi::Result<()> {
             .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO symbols (embedding, file_path, name, kind, language, line, end_line, signature, embedding_text)
+                "INSERT OR REPLACE INTO symbols (file_path, line, name, kind, language, end_line, signature, embedding_text, embedding)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ).map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
 
             for (sym, emb) in symbols.iter().zip(embeddings.iter()) {
-                let embedding_bytes = zerocopy::IntoBytes::as_bytes(emb.as_slice());
+                let embedding_bytes: &[u8] = bytemuck::cast_slice(emb.as_slice());
                 stmt.execute(rusqlite::params![
-                    embedding_bytes,
                     sym.file_path,
+                    sym.line,
                     sym.name,
                     sym.kind,
                     sym.language,
-                    sym.line,
                     sym.end_line,
                     sym.signature,
-                    sym.embedding_text
+                    sym.embedding_text,
+                    embedding_bytes
                 ]).map_err(|e| napi::Error::from_reason(format!("DB insert error: {}", e)))?;
             }
         }
