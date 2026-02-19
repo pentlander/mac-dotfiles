@@ -2,6 +2,8 @@
 //!
 //! Provides MLX GPU embedding (CodeRankEmbed) and SQLite+sqlite-vec storage/search.
 //! Called from the TypeScript pi extension via napi-rs.
+//!
+//! Designed for minimal FFI overhead: batch APIs everywhere, embeddings never cross the boundary.
 
 pub mod db;
 pub mod model;
@@ -9,8 +11,8 @@ pub mod model;
 use db::SearchDB;
 use model::{mean_pool_normalize, NomicBertConfig, NomicBertModel};
 use mlx_rs::module::ModuleParametersExt;
-use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
@@ -42,20 +44,17 @@ fn with_state<T>(f: impl FnOnce(&mut State) -> napi::Result<T>) -> napi::Result<
 pub fn init(model_dir: String, tokenizer_path: String) -> napi::Result<()> {
     let model_dir = PathBuf::from(&model_dir);
 
-    // Load config
     let config_str = std::fs::read_to_string(model_dir.join("config.json"))
         .map_err(|e| napi::Error::from_reason(format!("Failed to read config.json: {}", e)))?;
     let config: NomicBertConfig = serde_json::from_str(&config_str)
         .map_err(|e| napi::Error::from_reason(format!("Failed to parse config.json: {}", e)))?;
 
-    // Create model and load weights
     let mut model = NomicBertModel::new(&config)
         .map_err(|e| napi::Error::from_reason(format!("Failed to create model: {}", e)))?;
     model
         .load_safetensors(model_dir.join("model.safetensors"))
         .map_err(|e| napi::Error::from_reason(format!("Failed to load weights: {}", e)))?;
 
-    // Load tokenizer
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| napi::Error::from_reason(format!("Failed to load tokenizer: {}", e)))?;
 
@@ -81,11 +80,14 @@ pub fn open_db(db_path: String) -> napi::Result<()> {
 }
 
 #[napi]
-pub fn is_gpu() -> bool {
-    matches!(mlx_rs::Device::default(), mlx_rs::Device { .. })
+pub fn close_db() -> napi::Result<()> {
+    with_state(|state| {
+        state.db = None;
+        Ok(())
+    })
 }
 
-// ── Embedding ──────────────────────────────────────────────────────────
+// ── Internal embedding helpers ─────────────────────────────────────────
 
 fn tokenize_batch(
     tokenizer: &Tokenizer,
@@ -158,19 +160,7 @@ fn embed_internal(
     Ok(results)
 }
 
-#[napi]
-pub fn embed(texts: Vec<String>, is_query: bool) -> napi::Result<Vec<Vec<f64>>> {
-    with_state(|state| {
-        let vecs = embed_internal(&mut state.model, &state.tokenizer, &texts, is_query)?;
-        // napi doesn't support Vec<Vec<f32>>, convert to f64
-        Ok(vecs
-            .into_iter()
-            .map(|v| v.into_iter().map(|x| x as f64).collect())
-            .collect())
-    })
-}
-
-// ── Database operations ────────────────────────────────────────────────
+// ── Batch DB helpers ───────────────────────────────────────────────────
 
 fn get_db(state: &mut State) -> napi::Result<&mut SearchDB> {
     state
@@ -178,6 +168,8 @@ fn get_db(state: &mut State) -> napi::Result<&mut SearchDB> {
         .as_mut()
         .ok_or_else(|| napi::Error::from_reason("DB not opened. Call open_db() first."))
 }
+
+// ── napi types ─────────────────────────────────────────────────────────
 
 #[napi(object)]
 pub struct JsFileRow {
@@ -218,23 +210,24 @@ pub struct SymbolInput {
     pub signature: Option<String>,
 }
 
-#[napi]
-pub fn db_get_file(path: String) -> napi::Result<Option<JsFileRow>> {
-    with_state(|state| {
-        let db = get_db(state)?;
-        let row = db
-            .get_file(&path)
-            .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
-        Ok(row.map(|r| JsFileRow {
-            path: r.path,
-            hash: r.hash,
-            language: r.language,
-            symbol_count: r.symbol_count,
-            indexed_at: r.indexed_at as f64,
-        }))
-    })
+#[napi(object)]
+pub struct FileInput {
+    pub path: String,
+    pub hash: String,
+    pub language: Option<String>,
+    pub symbol_count: i32,
 }
 
+#[napi(object)]
+pub struct SearchFilters {
+    pub language: Option<String>,
+    pub kind: Option<String>,
+    pub path_prefix: Option<String>,
+}
+
+// ── Batch APIs ─────────────────────────────────────────────────────────
+
+/// Get all indexed files. Single FFI call returns everything.
 #[napi]
 pub fn db_get_all_files() -> napi::Result<Vec<JsFileRow>> {
     with_state(|state| {
@@ -255,30 +248,51 @@ pub fn db_get_all_files() -> napi::Result<Vec<JsFileRow>> {
     })
 }
 
+/// Delete multiple files and their symbols in a single transaction.
 #[napi]
-pub fn db_upsert_file(
-    path: String,
-    hash: String,
-    language: Option<String>,
-    symbol_count: i32,
-) -> napi::Result<()> {
+pub fn delete_files(paths: Vec<String>) -> napi::Result<()> {
     with_state(|state| {
         let db = get_db(state)?;
-        db.upsert_file(&path, &hash, language.as_deref(), symbol_count)
-            .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))
+        let tx = db.transaction()
+            .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
+        for path in &paths {
+            tx.execute("DELETE FROM symbols WHERE file_path = ?", rusqlite::params![path])
+                .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
+            tx.execute("DELETE FROM files WHERE path = ?", rusqlite::params![path])
+                .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
+        }
+        tx.commit()
+            .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
+        Ok(())
     })
 }
 
+/// Upsert multiple file records in a single transaction.
 #[napi]
-pub fn db_delete_file(path: String) -> napi::Result<()> {
+pub fn upsert_files(files: Vec<FileInput>) -> napi::Result<()> {
     with_state(|state| {
         let db = get_db(state)?;
-        db.delete_file_and_symbols(&path)
-            .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))
+        let tx = db.transaction()
+            .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        for f in &files {
+            tx.execute(
+                "INSERT OR REPLACE INTO files (path, hash, language, symbol_count, indexed_at) VALUES (?, ?, ?, ?, ?)",
+                rusqlite::params![f.path, f.hash, f.language, f.symbol_count, now],
+            ).map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
+        }
+        tx.commit()
+            .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
+        Ok(())
     })
 }
 
-/// Embed and insert symbols in a single call. Embeddings never cross the napi boundary.
+/// Embed and insert symbols in a single call.
+/// Embeddings never cross the napi boundary.
+/// Wraps all inserts in a transaction for performance.
 #[napi]
 pub fn index_symbols(symbols: Vec<SymbolInput>) -> napi::Result<()> {
     with_state(|state| {
@@ -286,62 +300,101 @@ pub fn index_symbols(symbols: Vec<SymbolInput>) -> napi::Result<()> {
             return Ok(());
         }
 
-        // Collect embedding texts
         let texts: Vec<String> = symbols.iter().map(|s| s.embedding_text.clone()).collect();
-
-        // Embed all texts
         let embeddings = embed_internal(&mut state.model, &state.tokenizer, &texts, false)?;
 
-        // Insert into DB
         let db = get_db(state)?;
-        for (sym, emb) in symbols.iter().zip(embeddings.iter()) {
-            db.insert_symbol(
-                emb,
-                &sym.file_path,
-                &sym.name,
-                &sym.kind,
-                &sym.language,
-                sym.line,
-                sym.end_line,
-                sym.signature.as_deref(),
-                &sym.embedding_text,
-            )
-            .map_err(|e| napi::Error::from_reason(format!("DB insert error: {}", e)))?;
-        }
+        let tx = db.transaction()
+            .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO symbols (embedding, file_path, name, kind, language, line, end_line, signature, embedding_text)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ).map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
 
+            for (sym, emb) in symbols.iter().zip(embeddings.iter()) {
+                let embedding_bytes = zerocopy::IntoBytes::as_bytes(emb.as_slice());
+                stmt.execute(rusqlite::params![
+                    embedding_bytes,
+                    sym.file_path,
+                    sym.name,
+                    sym.kind,
+                    sym.language,
+                    sym.line,
+                    sym.end_line,
+                    sym.signature,
+                    sym.embedding_text
+                ]).map_err(|e| napi::Error::from_reason(format!("DB insert error: {}", e)))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| napi::Error::from_reason(format!("DB error: {}", e)))?;
         Ok(())
     })
 }
 
-#[napi(object)]
-pub struct SearchFilters {
-    pub language: Option<String>,
-    pub kind: Option<String>,
-    pub path_prefix: Option<String>,
-}
-
-/// Embed query and search in a single call. Query embedding never crosses the napi boundary.
+/// Multi-query search with dedup, all in Rust.
+///
+/// Embeds all queries as a batch, runs each against the DB,
+/// deduplicates by (file_path, line, name) keeping the best score,
+/// and returns top_k results sorted by score descending.
 #[napi]
-pub fn search(query: String, top_k: i32, filters: SearchFilters) -> napi::Result<Vec<JsSearchResult>> {
+pub fn search(
+    queries: Vec<String>,
+    top_k: i32,
+    threshold: f64,
+    filters: SearchFilters,
+) -> napi::Result<Vec<JsSearchResult>> {
     with_state(|state| {
-        // Embed the query
-        let embeddings =
-            embed_internal(&mut state.model, &state.tokenizer, &[query], true)?;
-        let query_emb = &embeddings[0];
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        // Search
+        // Batch-embed all queries at once
+        let query_embeddings =
+            embed_internal(&mut state.model, &state.tokenizer, &queries, true)?;
+
         let db = get_db(state)?;
-        let results = db
-            .search(
-                query_emb,
-                top_k,
-                filters.language.as_deref(),
-                filters.kind.as_deref(),
-                filters.path_prefix.as_deref(),
-            )
-            .map_err(|e| napi::Error::from_reason(format!("Search error: {}", e)))?;
 
-        Ok(results
+        // Fetch more per-query so we have enough after dedup
+        let per_query_k = if queries.len() > 1 {
+            (top_k as f64 * 1.5).ceil() as i32
+        } else {
+            top_k
+        };
+
+        // Run each query and merge results, keeping best score per symbol
+        let mut best_by_key: HashMap<String, db::SearchResult> = HashMap::new();
+
+        for emb in &query_embeddings {
+            let results = db
+                .search(
+                    emb,
+                    per_query_k,
+                    filters.language.as_deref(),
+                    filters.kind.as_deref(),
+                    filters.path_prefix.as_deref(),
+                )
+                .map_err(|e| napi::Error::from_reason(format!("Search error: {}", e)))?;
+
+            for r in results {
+                let key = format!("{}:{}:{}", r.file_path, r.line, r.name);
+                let existing = best_by_key.get(&key);
+                if existing.map_or(true, |e| r.score > e.score) {
+                    best_by_key.insert(key, r);
+                }
+            }
+        }
+
+        // Sort by best score, filter by threshold, take top_k
+        let mut merged: Vec<_> = best_by_key
+            .into_values()
+            .filter(|r| r.score >= threshold)
+            .collect();
+        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        merged.truncate(top_k as usize);
+
+        Ok(merged
             .into_iter()
             .map(|r| JsSearchResult {
                 file_path: r.file_path,
@@ -368,13 +421,5 @@ pub fn db_get_stats() -> napi::Result<JsStats> {
             symbol_count: stats.symbol_count as f64,
             file_count: stats.file_count as f64,
         })
-    })
-}
-
-#[napi]
-pub fn close_db() -> napi::Result<()> {
-    with_state(|state| {
-        state.db = None;
-        Ok(())
     })
 }

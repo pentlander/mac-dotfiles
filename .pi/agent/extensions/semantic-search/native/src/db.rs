@@ -320,12 +320,8 @@ impl SearchDB {
         })
     }
 
-    /// Begin a transaction. Returns a guard that commits on drop.
+    /// Begin a transaction on the underlying connection.
     pub fn transaction(&mut self) -> SqlResult<rusqlite::Transaction<'_>> {
         self.conn.transaction()
-    }
-
-    pub fn close(self) -> SqlResult<()> {
-        self.conn.close().map_err(|(_, e)| e)
     }
 }
