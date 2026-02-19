@@ -262,9 +262,8 @@ impl NomicAttention {
         let qkv = self.Wqkv.forward(x)?;
 
         // Split into Q, K, V along last axis: each [B, L, H]
+        // Then reshape to [B, L, heads, head_dim] and transpose to [B, heads, L, head_dim]
         let parts = qkv.split(3, -1)?;
-
-        // Reshape to [B, L, heads, head_dim] then transpose to [B, heads, L, head_dim]
         let q = parts[0]
             .reshape(&[b, l, self.num_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
@@ -279,18 +278,11 @@ impl NomicAttention {
         let q = self.rope.forward(RopeInput::from((&q,)))?;
         let k = self.rope.forward(RopeInput::from((&k,)))?;
 
-        // Scaled dot-product attention
-        let scale = Array::from_f32(1.0 / (self.head_dim as f32).sqrt());
-        let scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?.multiply(&scale)?;
-
-        let scores = if let Some(m) = mask {
-            scores.add(m)?
-        } else {
-            scores
-        };
-
-        let weights = ops::softmax_axis(&scores, -1, None)?;
-        let attn = weights.matmul(&v)?;
+        // Scaled dot-product attention (fused Metal kernel)
+        use mlx_rs::fast::ScaledDotProductAttentionMask;
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let sdpa_mask: Option<ScaledDotProductAttentionMask> = mask.map(ScaledDotProductAttentionMask::Array);
+        let attn = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, sdpa_mask, None::<&Array>)?;
 
         // Reshape back: [B, heads, L, head_dim] → [B, L, heads*head_dim]
         let attn = attn
