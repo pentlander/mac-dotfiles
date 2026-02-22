@@ -3,7 +3,8 @@ if status is-interactive
     if test -d /opt/homebrew
         /opt/homebrew/bin/brew shellenv | source
     end
-    source "$(brew --prefix)/share/google-cloud-sdk/path.fish.inc"
+
+    test -d  "$(brew --prefix)/share/google-cloud-sdk/path.fish.inc"; and source "$(brew --prefix)/share/google-cloud-sdk/path.fish.inc"
     zoxide init fish | source
     
 
@@ -54,6 +55,7 @@ if status is-interactive
     abbr -a jds 'jj describe -m'
     abbr -a je 'jj edit'
     abbr -a jl 'jj log'
+    abbr -a jlg 'jj log --stat --limit 10'
     abbr -a jlt 'jj log -r "trunk()..@"'
     abbr -a js 'jj squash'
     abbr -a jsi 'jj split'

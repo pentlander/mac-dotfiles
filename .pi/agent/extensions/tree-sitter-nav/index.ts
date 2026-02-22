@@ -23,6 +23,7 @@ import { Type } from "@sinclair/typebox";
 import { resolve, extname, relative, sep } from "node:path";
 import { readdirSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
+import { parse as parseShell } from "shell-quote";
 
 import { parseFile, clearCache } from "./parser.js";
 import {
@@ -670,30 +671,46 @@ Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BY
   // ── System prompt & grep/rg blocking ───────────────────────────────────
 
   pi.on("before_agent_start", async (event) => {
-    const instruction = `\n\n**IMPORTANT: ALWAYS use \`code_nav\` as the FIRST tool for exploring code structure** (finding symbols, types, interfaces, functions, classes, enums, methods, etc.). For single files, \`code_nav\` shows all nested symbols. For directories, it shows top-level symbols — if you need inner/nested symbols, call \`code_nav\` on the specific file. Use \`find_identifiers\` to find all occurrences of a name across files (like find-references but not scope-aware — skips strings and comments, exact identifier match only). \`grep\` and \`rg\` are NOT available in bash — use the \`string_search\` tool for text/pattern searches (config values, error strings, TODOs, etc.). Use \`code_nav\` for structure, \`find_identifiers\` for usage search, \`string_search\` for text pattern searches, and \`read\` for file contents.`;
+    const instruction = `\n\n**IMPORTANT: ALWAYS use \`code_nav\` as the FIRST tool for exploring code structure** (finding symbols, types, interfaces, functions, classes, enums, methods, etc.). For single files, \`code_nav\` shows all nested symbols. For directories, it shows top-level symbols — if you need inner/nested symbols, call \`code_nav\` on the specific file. Use \`find_identifiers\` to find all occurrences of a name across files (like find-references but not scope-aware — skips strings and comments, exact identifier match only). \`grep\` and \`rg\` are NOT available in bash — use the \`string_search\` tool for text/pattern searches (config values, error strings, TODOs, etc.). Use \`code_nav\` for structure, \`find_identifiers\` for usage search, \`string_search\` for text pattern searches, and \`read\` for file contents.\n\nWhen you need to filter command output, \`rg\` is allowed after a pipe (e.g. \`cmd | rg pattern\`). \`grep\` is not available.`;
     return {
       systemPrompt: event.systemPrompt + instruction,
     };
   });
 
-  // Unconditionally block grep/rg in bash — use string_search tool instead
+  // Block grep entirely. Block rg as standalone file search but allow after pipes.
   pi.on("tool_call", async (event) => {
     if (!isToolCallEventType("bash", event)) return;
 
     const cmd = event.input.command;
     if (!cmd) return;
 
-    // Quick check: does the command contain grep or rg?
-    if (!/(^|\||\;|\&|\()\s*(grep|rg|ripgrep)\b/.test(cmd) &&
-        !/\b(grep|rg|ripgrep)\s/.test(cmd)) {
+    // Block grep unconditionally (use rg in pipes instead)
+    if (/\bgrep\b/.test(cmd)) {
+      return {
+        block: true,
+        reason:
+          `BLOCKED: grep is not available. Use the \`string_search\` tool for text pattern searches, ` +
+          `or \`rg\` after a pipe to filter command output (e.g. \`cmd | rg pattern\`).`,
+      };
+    }
+
+    // Quick check: does the command mention rg at all?
+    if (!/\b(rg|ripgrep)\b/.test(cmd)) {
+      return;
+    }
+
+    // Allow rg only after a pipe (filtering command output).
+    // Block when used as a standalone command (file search).
+    if (!isStandaloneGrep(cmd)) {
       return;
     }
 
     return {
       block: true,
       reason:
-        `BLOCKED: grep/rg are not available in bash. Use the \`string_search\` tool for text pattern searches, ` +
-        `\`code_nav\` for code structure, or \`find_identifiers\` for identifier usage.`,
+        `BLOCKED: rg for file searches — use the \`string_search\` tool for text pattern searches, ` +
+        `\`code_nav\` for code structure, or \`find_identifiers\` for identifier usage. ` +
+        `rg is allowed after a pipe (e.g. \`cmd | rg pattern\`).`,
     };
   });
 
@@ -701,6 +718,68 @@ Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BY
   pi.on("session_shutdown", async () => {
     clearCache();
   });
+}
+
+// ─── grep/rg pipe detection ─────────────────────────────────────────────
+
+const GREP_BINS = new Set(["grep", "rg", "ripgrep"]);
+
+/**
+ * Determine if a shell command uses grep/rg as a standalone file search
+ * (which should be blocked) vs. only as a pipe filter (which is allowed).
+ *
+ * Uses shell-quote to properly tokenize the command, handling quotes,
+ * escapes, and operators correctly. Walks the token stream and tracks
+ * whether each command position follows a pipe `|` or starts a new
+ * command (after `&&`, `||`, `;`, or at the beginning).
+ *
+ * Returns true (block) if any grep/rg appears in a non-pipe position.
+ */
+function isStandaloneGrep(cmd: string): boolean {
+  const tokens = parseShell(cmd);
+
+  // afterPipe: the next string token is a command that receives piped stdin
+  // atCommandStart: the next string token is the first word of a new command
+  let afterPipe = false;
+  let atCommandStart = true;
+
+  for (const token of tokens) {
+    if (typeof token === "object" && token !== null && "op" in token) {
+      const op = token.op;
+      if (op === "|") {
+        afterPipe = true;
+        atCommandStart = true;
+      } else {
+        // &&, ||, ;, >, >>, etc. — start a new command (not piped)
+        // Redirects (>, >>, >&, etc.) don't start a new command,
+        // but they also don't affect whether we're at command start
+        // for the grep check, so treating them as non-pipe is safe.
+        if (op === "&&" || op === "||" || op === ";") {
+          afterPipe = false;
+          atCommandStart = true;
+        }
+        // For redirects (>, >>, >&, <, etc.) don't change state
+      }
+      continue;
+    }
+
+    if (typeof token === "string") {
+      if (atCommandStart) {
+        // This token is the command name (possibly with a path prefix)
+        const basename = token.split("/").pop() ?? token;
+        if (GREP_BINS.has(basename) && !afterPipe) {
+          return true;
+        }
+        atCommandStart = false;
+      }
+      // Non-command tokens (arguments) — skip
+      continue;
+    }
+
+    // Glob tokens from shell-quote ({pattern: "*.txt"}) — treated as args
+  }
+
+  return false;
 }
 
 // ─── Directory scanning ─────────────────────────────────────────────────
