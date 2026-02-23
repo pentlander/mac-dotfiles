@@ -60,12 +60,19 @@ if status is-interactive
     abbr -a js 'jj squash'
     abbr -a jsi 'jj split'
     abbr -a jab 'jj absorb'
-    abbr -a jgf 'jj git fetch --branch master'
-    abbr -a jgp 'jj git push'
+    abbr -a jgp 'jj git push --deleted'
+    abbr -a jgf 'jj git fetch --tracked'
+    abbr -a jsn 'jj git fetch --tracked; and jj rebase -d "trunk()" --skip-emptied'
+    abbr -a jsh 'jj show'
+    abbr -a jb 'jj bookmark'
+    abbr -a jbd 'jj bookmark delete'
+    abbr -a jbl 'jj bookmark list'
+    abbr -a jbm 'jj b move \'regex:"main|master"\''
+    abbr -a jbs --set-cursor "jj bookmark set '%' -r @"
     abbr -a jrb 'jj rebase'
     abbr -a ju 'jj undo'
     abbr -a jst 'jj status'
-    abbr -a jbs --set-cursor "jj bookmark set '%' -r @"
+    abbr -a jsp 'jj sp'
 
     abbr -a st 'stacked'
     abbr -a stca --set-cursor "stacked create -a '%'"
