@@ -59,19 +59,36 @@ export async function indexDirectory(
     filesDeleted: 0, symbolsIndexed: 0, indexTimeMs: 0, embedTimeMs: 0,
   };
 
-  // Load .gitignore chain
+  // .gitignore handling: patterns are prefixed with their directory so that
+  // e.g. `network-cp` in `packages/network-cp/.gitignore` only matches
+  // `packages/network-cp/network-cp`, not the directory itself.
+  // The walker (collectFiles) loads .gitignore from each directory it visits.
+  // Here we only pre-load ancestor gitignores when scanDir != repoRoot.
   const ignoreFactory = typeof ignore === "function" ? ignore : ignore.default;
   const ig = ignoreFactory();
 
-  const rootGitignore = join(repoRoot, ".gitignore");
-  if (existsSync(rootGitignore)) ig.add(readFileSync(rootGitignore, "utf-8"));
   if (scanDir !== repoRoot) {
     const rel = relative(repoRoot, scanDir);
     let cur = repoRoot;
     for (const part of rel.split("/")) {
       cur = join(cur, part);
       const gi = join(cur, ".gitignore");
-      if (cur !== repoRoot && existsSync(gi)) ig.add(readFileSync(gi, "utf-8"));
+      if (existsSync(gi)) {
+        const prefix = relative(repoRoot, cur);
+        if (prefix === "") {
+          ig.add(readFileSync(gi, "utf-8"));
+        } else {
+          const lines = readFileSync(gi, "utf-8").split("\n");
+          const prefixed = lines.map((line) => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith("#")) return line;
+            if (trimmed.startsWith("!")) return `!${prefix}/${trimmed.slice(1)}`;
+            if (trimmed.startsWith("/")) return `/${prefix}${trimmed}`;
+            return `${prefix}/${trimmed}`;
+          });
+          ig.add(prefixed.join("\n"));
+        }
+      }
     }
   }
 
@@ -207,6 +224,25 @@ function collectFiles(dir: string, ig: any, rootDir: string): string[] {
     let entries: ReturnType<typeof readdirSync>;
     try { entries = readdirSync(d, { withFileTypes: true }); } catch { return; }
     entries.sort((a, b) => a.name.localeCompare(b.name));
+
+    // Load .gitignore in this directory (prefix patterns with dir's relative path)
+    const gi = join(d, ".gitignore");
+    if (existsSync(gi)) {
+      const prefix = relative(rootDir, d);
+      const lines = readFileSync(gi, "utf-8").split("\n");
+      if (prefix === "") {
+        ig.add(lines.join("\n"));
+      } else {
+        const prefixed = lines.map((line) => {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith("#")) return line;
+          if (trimmed.startsWith("!")) return `!${prefix}/${trimmed.slice(1)}`;
+          if (trimmed.startsWith("/")) return `/${prefix}${trimmed}`;
+          return `${prefix}/${trimmed}`;
+        });
+        ig.add(prefixed.join("\n"));
+      }
+    }
 
     for (const entry of entries) {
       const fullPath = resolve(d, entry.name);
