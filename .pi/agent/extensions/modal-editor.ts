@@ -21,7 +21,18 @@
  *   x       — delete character under cursor
  *   C       — delete to end of line, enter insert mode
  *   cc      — clear line, enter insert mode
+ *   cw      — change word forward
+ *   cb      — change word backward
+ *   ce      — change to end of word
+ *   c$      — change to end of line (same as C)
+ *   c0      — change to start of line
  *   dd      — delete current line
+ *   dw      — delete word forward
+ *   db      — delete word backward
+ *   de      — delete to end of word
+ *   d$      — delete to end of line
+ *   d0      — delete to start of line
+ *   D       — delete to end of line (same as d$)
  *   v       — open prompt in $EDITOR (nvim)
  *   Escape  — pass through to app (abort agent, etc.)
  *
@@ -51,6 +62,8 @@ const ESC = {
   backspace: "\x7f",
   deleteToEnd: "\x0b",   // ctrl+k
   deleteToStart: "\x15", // ctrl+u
+  deleteWordForward: "\x1bd",  // alt+d
+  deleteWordBackward: "\x17",  // ctrl+w
 };
 
 class ModalEditor extends CustomEditor {
@@ -83,23 +96,46 @@ class ModalEditor extends CustomEditor {
 
     // ── Normal mode ──
 
-    // Handle multi-key sequences (dd, cc)
-    if (this.pendingKey === "d") {
+    // Handle operator-motion sequences (d/c + motion)
+    if (this.pendingKey === "d" || this.pendingKey === "c") {
+      const op = this.pendingKey;
       this.pendingKey = null;
-      if (data === "d") {
-        this.deleteCurrentLine();
-        return;
-      }
-      return;
-    }
-    if (this.pendingKey === "c") {
-      this.pendingKey = null;
-      if (data === "c") {
-        // cc: clear line contents, stay on the line in insert mode
-        super.handleInput(ESC.home);
-        super.handleInput(ESC.deleteToEnd);
-        this.mode = "insert";
-        return;
+      const enterInsert = op === "c";
+
+      switch (data) {
+        case "d": // dd — delete line
+          if (op === "d") { this.deleteCurrentLine(); return; }
+          break;
+        case "c": // cc — clear line, enter insert
+          if (op === "c") {
+            super.handleInput(ESC.home);
+            super.handleInput(ESC.deleteToEnd);
+            this.mode = "insert";
+            return;
+          }
+          break;
+        case "w": // dw/cw — word forward
+          super.handleInput(ESC.deleteWordForward);
+          if (enterInsert) this.mode = "insert";
+          return;
+        case "b": // db/cb — word backward
+          super.handleInput(ESC.deleteWordBackward);
+          if (enterInsert) this.mode = "insert";
+          return;
+        case "e": // de/ce — to end of word
+          // word-right lands at start of next word, so delete that then backspace the space
+          // alt+d (deleteWordForward) already does "to end of word" behavior
+          super.handleInput(ESC.deleteWordForward);
+          if (enterInsert) this.mode = "insert";
+          return;
+        case "$": // d$/c$ — to end of line
+          super.handleInput(ESC.deleteToEnd);
+          if (enterInsert) this.mode = "insert";
+          return;
+        case "0": // d0/c0 — to start of line
+          super.handleInput(ESC.deleteToStart);
+          if (enterInsert) this.mode = "insert";
+          return;
       }
       return;
     }
@@ -180,6 +216,10 @@ class ModalEditor extends CustomEditor {
         // Delete from cursor to end of line, enter insert mode
         super.handleInput(ESC.deleteToEnd);
         this.mode = "insert";
+        return;
+      case "D":
+        // Delete from cursor to end of line
+        super.handleInput(ESC.deleteToEnd);
         return;
 
       // External editor
